@@ -28,10 +28,21 @@ jobs:
       - name: Install NSIS
         if: github.event_name != 'pull_request'
         run: choco install nsis --yes --no-progress
+      - name: Prepare updater signing key file
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_SECRET: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_SECRET)) {
+            throw 'Configure the TAURI_SIGNING_PRIVATE_KEY Actions secret before building an installer.'
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'easypto-updater.key'
+          [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY_SECRET, [System.Text.UTF8Encoding]::new($false))
+          "TAURI_SIGNING_PRIVATE_KEY=$keyPath" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
       - name: Build Windows installer
         if: github.event_name != 'pull_request'
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
       - name: Upload installer artifact
