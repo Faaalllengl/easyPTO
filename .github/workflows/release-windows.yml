@@ -1,0 +1,86 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Check release version and updater secrets
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          $packageVersion = node -p "require('./package.json').version"
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($tagVersion -ne $packageVersion -or $tagVersion -ne $tauriVersion -or $tagVersion -ne $cargoVersion) {
+            throw "Tag $tagVersion must match package, Tauri, and Cargo versions ($packageVersion, $tauriVersion, $cargoVersion)."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'Configure the TAURI_SIGNING_PRIVATE_KEY Actions secret before creating a release tag.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            throw 'Configure TAURI_SIGNING_PRIVATE_KEY_PASSWORD with the updater key password.'
+          }
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Build Windows installer and signed updater artifact
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Create update manifest and checksum
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.TrimStart('v')
+          $bundleDir = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          $installer = Get-ChildItem $bundleDir -Filter '*.exe' | Select-Object -First 1
+          if (-not $installer) { throw "No NSIS installer found in $bundleDir" }
+          $signatureFile = "$($installer.FullName).sig"
+          if (-not (Test-Path -LiteralPath $signatureFile)) { throw "Updater signature was not produced: $signatureFile" }
+          $signature = (Get-Content -Raw -LiteralPath $signatureFile).Trim()
+          $assetName = [uri]::EscapeDataString($installer.Name)
+          $manifest = [ordered]@{
+            version = $version
+            notes = "easyPTO $tag"
+            pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            platforms = @{
+              'windows-x86_64' = @{
+                signature = $signature
+                url = "https://github.com/Faaalllengl/easyPTO/releases/download/$tag/$assetName"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM (Join-Path $bundleDir 'latest.json')
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -Encoding ascii "$($installer.FullName).sha256"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $bundleDir = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          $files = Get-ChildItem $bundleDir -File |
+            Where-Object { $_.Extension -eq '.exe' -or $_.Name.EndsWith('.exe.sig') -or $_.Name -eq 'latest.json' -or $_.Name.EndsWith('.exe.sha256') } |
+            ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME $files --title "easyPTO $env:GITHUB_REF_NAME" --generate-notes

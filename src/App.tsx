@@ -1,0 +1,1041 @@
+import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import "./App.css";
+import { exportExcel, exportWord, type ReportSnapshot } from "./report";
+
+type DatabaseStatus = { schemaVersion: number; currentSchemaVersion: number };
+type ProjectListItem = {
+  id: string;
+  name: string;
+  routeStart: number;
+  routeEnd: number;
+  updatedAt: string;
+};
+type Interval = { fromCentiPk: number; toCentiPk: number };
+type WorkArea = { id: string; kind: "main" | "bridge" | "custom"; name: string; intervals: Interval[] };
+type Exclusion = { id: string; name: string; intervals: Interval[]; reason: string; appliesToLayerIds: string[]; workAreaIds: string[] };
+type JournalEvent = { id: string; happenedAt: string; action: string; entityType: string; entityId: string | null; summary: string; beforeJson: string | null; afterJson: string | null };
+type BackupEntry = { fileName: string; createdAt: string; projectNames: string[]; source: string; diagnostic: string | null };
+type Segment = {
+  id: string;
+  workAreaId: string;
+  fromCentiPk: number;
+  toCentiPk: number;
+  workDate: string;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+type LayerSnapshot = {
+  id: string;
+  code: string;
+  name: string;
+  sortOrder: number;
+  color: string;
+  baseLayerId: string | null;
+  planPercent: number | null;
+  planDate: string | null;
+  workAreaIds: string[];
+  segments: Segment[];
+  workAreaLengthCentiPk: number;
+  coveredLengthCentiPk: number;
+  remainingLengthCentiPk: number;
+  progressPercent: number;
+  planDeltaPp: number | null;
+  coveredIntervals: Interval[];
+  frontIntervals: Interval[];
+  frontLengthCentiPk: number;
+};
+type ProjectSnapshot = {
+  project: ProjectListItem;
+  calculationVersion: string;
+  bridgeEnabled: boolean;
+  bridgeAreaId: string | null;
+  workAreas: WorkArea[];
+  exclusions: Exclusion[];
+  journal: JournalEvent[];
+  layers: LayerSnapshot[];
+  summary: {
+    workAreaLengthCentiPk: number;
+    coveredLengthCentiPk: number;
+    remainingLengthCentiPk: number;
+    progressPercent: number;
+    layersBehindPlan: number;
+  };
+};
+const areaProgress = (projectSnapshot: ProjectSnapshot, areaId: string | null, enabled = true) => {
+  if (!enabled || !areaId) return { covered: 0, total: 0, percent: 0 };
+  const area = projectSnapshot.workAreas.find((item) => item.id === areaId);
+  if (!area) return { covered: 0, total: 0, percent: 0 };
+  const layers = projectSnapshot.layers.filter((layer) => layer.workAreaIds.includes(area.id));
+  const areaLength = intervalLength(area.intervals);
+  const covered = layers.reduce((sum, layer) => {
+    const coverage = intersectIntervals(
+      mergeIntervals(layer.segments.filter((segment) => segment.workAreaId === area.id).map((segment) => ({ fromCentiPk: segment.fromCentiPk, toCentiPk: segment.toCentiPk }))),
+      area.intervals,
+    );
+    const cuts = projectSnapshot.exclusions.filter((exclusion) => exclusion.appliesToLayerIds.includes(layer.id) && exclusion.workAreaIds.includes(area.id)).flatMap((exclusion) => exclusion.intervals);
+    return sum + intervalLength(subtractIntervals(coverage, cuts));
+  }, 0);
+  const total = areaLength * layers.length;
+  return { covered, total, percent: total ? covered * 100 / total : 0 };
+};
+type LayerInput = {
+  code: string;
+  name: string;
+  color: string;
+  sortOrder: number;
+  baseLayerId: string | null;
+  planPercent: number | null;
+  planDate: string | null;
+};
+type SegmentInput = { workAreaId: string; fromPk: string; toPk: string; workDate: string; note: string | null };
+type Filter = "all" | "unfinished" | "behind";
+type LayerForm = { code: string; name: string; color: string; sortOrder: string; baseLayerId: string; planPercent: string; planDate: string };
+type SegmentForm = { workAreaId: string; fromPk: string; toPk: string; workDate: string; note: string };
+type BridgeForm = { enabled: boolean; fromPk: string; toPk: string; layerIds: string[] };
+type ExclusionForm = { id: string | null; name: string; reason: string; fromPk: string; toPk: string; layerIds: string[]; workAreaIds: string[] };
+type WorkAreaForm = { name: string; fromPk: string; toPk: string; layerIds: string[] };
+
+const formatNumber = (value: number, digits = 2) => new Intl.NumberFormat("ru-RU", {
+  minimumFractionDigits: digits,
+  maximumFractionDigits: digits,
+}).format(value);
+const formatKm = (centiPk: number, digits = 2) => `${formatNumber(centiPk / 1000, digits)} км`;
+const formatPk = (centiPk: number) => formatNumber(centiPk / 100, 2);
+const roundedPercent = (percent: number) => formatNumber(percent, 1);
+const formatDate = (value: string | null) => value ? new Intl.DateTimeFormat("ru-RU").format(new Date(`${value}T00:00:00`)) : "";
+const formatTimestamp = (value: string) => value ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(value)) : "Дата неизвестна";
+const asCentiPk = (value: string): number | null => {
+  const match = value.trim().match(/^(\d+)(?:[,.](\d{0,2}))?$/);
+  if (!match) return null;
+  const whole = Number(match[1]);
+  const fraction = (match[2] ?? "").padEnd(2, "0");
+  const result = whole * 100 + Number(fraction || "0");
+  return Number.isSafeInteger(result) ? result : null;
+};
+const markerPosition = (value: string, project: ProjectListItem | null) => {
+  if (!project) return null;
+  const centiPk = asCentiPk(value);
+  const routeLength = project.routeEnd - project.routeStart;
+  if (centiPk === null || centiPk < project.routeStart || centiPk > project.routeEnd || routeLength <= 0) return null;
+  return ((centiPk - project.routeStart) / routeLength) * 100;
+};
+const dateToday = () => new Date().toISOString().slice(0, 10);
+const emptyBridgeForm = (): BridgeForm => ({ enabled: false, fromPk: "", toPk: "", layerIds: [] });
+const emptyExclusionForm = (): ExclusionForm => ({ id: null, name: "", reason: "", fromPk: "", toPk: "", layerIds: [], workAreaIds: [] });
+const mergeIntervals = (intervals: Interval[]): Interval[] => intervals.slice().sort((a, b) => a.fromCentiPk - b.fromCentiPk || a.toCentiPk - b.toCentiPk).reduce<Interval[]>((merged, interval) => {
+  const last = merged[merged.length - 1];
+  if (last && interval.fromCentiPk <= last.toCentiPk) last.toCentiPk = Math.max(last.toCentiPk, interval.toCentiPk);
+  else merged.push({ ...interval });
+  return merged;
+}, []);
+const intersectIntervals = (left: Interval[], right: Interval[]): Interval[] => mergeIntervals(left.flatMap((a) => right.flatMap((b) => {
+  const fromCentiPk = Math.max(a.fromCentiPk, b.fromCentiPk);
+  const toCentiPk = Math.min(a.toCentiPk, b.toCentiPk);
+  return toCentiPk > fromCentiPk ? [{ fromCentiPk, toCentiPk }] : [];
+})));
+const subtractIntervals = (source: Interval[], cuts: Interval[]): Interval[] => {
+  let result = mergeIntervals(source);
+  for (const cut of mergeIntervals(cuts)) result = result.flatMap((item) => cut.toCentiPk <= item.fromCentiPk || cut.fromCentiPk >= item.toCentiPk ? [item] : [
+    ...(cut.fromCentiPk > item.fromCentiPk ? [{ fromCentiPk: item.fromCentiPk, toCentiPk: cut.fromCentiPk }] : []),
+    ...(cut.toCentiPk < item.toCentiPk ? [{ fromCentiPk: cut.toCentiPk, toCentiPk: item.toCentiPk }] : []),
+  ]);
+  return result;
+};
+const intervalLength = (intervals: Interval[]) => intervals.reduce((total, interval) => total + interval.toCentiPk - interval.fromCentiPk, 0);
+
+const emptyLayerForm = (sortOrder: number): LayerForm => ({
+  code: "",
+  name: "",
+  color: "#20796e",
+  sortOrder: String(sortOrder),
+  baseLayerId: "",
+  planPercent: "",
+  planDate: "",
+});
+const emptySegmentForm = (workAreaId = ""): SegmentForm => ({
+  workAreaId,
+  fromPk: "",
+  toPk: "",
+  workDate: dateToday(),
+  note: "",
+});
+
+function App() {
+  const [databaseStatus, setDatabaseStatus] = useState<DatabaseStatus | null>(null);
+  const [projects, setProjects] = useState<ProjectListItem[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [snapshot, setSnapshot] = useState<ProjectSnapshot | null>(null);
+  const [selectedLayerId, setSelectedLayerId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [filter, setFilter] = useState<Filter>("all");
+  const [search, setSearch] = useState("");
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [projectName, setProjectName] = useState("");
+  const [routeStartPk, setRouteStartPk] = useState("0,00");
+  const [routeEndPk, setRouteEndPk] = useState("10,00");
+  const [layerEditorOpen, setLayerEditorOpen] = useState(false);
+  const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
+  const [layerForm, setLayerForm] = useState<LayerForm>(emptyLayerForm(0));
+  const [segmentEditorOpen, setSegmentEditorOpen] = useState(false);
+  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
+  const [segmentForm, setSegmentForm] = useState<SegmentForm>(emptySegmentForm());
+  const [bridgeSettingsOpen, setBridgeSettingsOpen] = useState(false);
+  const [bridgeForm, setBridgeForm] = useState<BridgeForm>(emptyBridgeForm());
+  const [bridgePreview, setBridgePreview] = useState<ProjectSnapshot | null>(null);
+  const [exclusionEditorOpen, setExclusionEditorOpen] = useState(false);
+  const [exclusionForm, setExclusionForm] = useState<ExclusionForm>(emptyExclusionForm());
+  const [workAreaEditorOpen, setWorkAreaEditorOpen] = useState(false);
+  const [workAreaForm, setWorkAreaForm] = useState<WorkAreaForm>({ name: "", fromPk: "", toPk: "", layerIds: [] });
+  const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
+  const [backups, setBackups] = useState<BackupEntry[]>([]);
+  const [reportDialogOpen, setReportDialogOpen] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const refreshProjects = async () => {
+    const items = await invoke<ProjectListItem[]>("list_projects");
+    setProjects(items);
+    return items;
+  };
+
+  const renameSelectedProject = async () => {
+    if (!selectedProjectId || !selectedProject) return;
+    const name = window.prompt("Новое название объекта", selectedProject.name);
+    if (name === null || !name.trim()) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updatedProjects = await invoke<ProjectListItem[]>("rename_project", { projectId: selectedProjectId, name });
+      setProjects(updatedProjects);
+      const refreshed = await invoke<ProjectSnapshot>("get_project_snapshot", { projectId: selectedProjectId });
+      setSnapshot(refreshed);
+      setNotice("Название объекта изменено.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeSelectedProject = async () => {
+    if (!selectedProjectId || !selectedProject) return;
+    if (projects.length <= 1) {
+      setError("Нельзя удалить последний объект.");
+      return;
+    }
+    if (!window.confirm(`Удалить объект «${selectedProject.name}» и все его слои, отрезки и настройки?`)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const remaining = await invoke<ProjectListItem[]>("delete_project", { projectId: selectedProjectId });
+      setProjects(remaining);
+      const next = remaining[0];
+      setSelectedProjectId(next.id);
+      localStorage.setItem("easypto.activeProjectId", next.id);
+      setNotice("Объект удалён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const refreshBackups = async () => {
+    const result = await invoke<BackupEntry[]>("list_backups");
+    setBackups(result);
+  };
+
+  const openHistory = async () => {
+    setHistoryDialogOpen(true);
+    try {
+      await refreshBackups();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const createManualBackup = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const created = await invoke<BackupEntry>("create_backup");
+      await refreshBackups();
+      setNotice(`Резервная копия создана: ${created.fileName}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const restoreBackup = async (backup: BackupEntry) => {
+    const confirmed = window.confirm(`Восстановить базу из копии от ${formatTimestamp(backup.createdAt)}? Это заменит все текущие объекты. Перед восстановлением приложение создаст страховочную копию текущей базы.`);
+    if (!confirmed) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const restoredProjects = await invoke<ProjectListItem[]>("restore_backup", { fileName: backup.fileName });
+      setProjects(restoredProjects);
+      const currentStillExists = restoredProjects.some((project) => project.id === selectedProjectId);
+      const nextProjectId = currentStillExists ? selectedProjectId : restoredProjects[0]?.id ?? "";
+      setSnapshot(null);
+      setSelectedProjectId(nextProjectId);
+      if (nextProjectId) {
+        localStorage.setItem("easypto.activeProjectId", nextProjectId);
+        const restoredSnapshot = await invoke<ProjectSnapshot>("get_project_snapshot", { projectId: nextProjectId });
+        setSnapshot(restoredSnapshot);
+      }
+      await refreshBackups();
+      setNotice("База восстановлена. Текущая версия перед этим сохранена в резервную копию.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      invoke<DatabaseStatus>("database_status"),
+      invoke<ProjectListItem[]>("list_projects"),
+    ]).then(([status, items]) => {
+      if (!alive) return;
+      setDatabaseStatus(status);
+      setProjects(items);
+      const lastProjectId = localStorage.getItem("easypto.activeProjectId");
+      const preferred = items.find((project) => project.id === lastProjectId) ?? items[0];
+      if (preferred) setSelectedProjectId(preferred.id);
+      else setLoading(false);
+    }).catch((reason: unknown) => {
+      if (!alive) return;
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setLoading(false);
+    });
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    const timer = window.setTimeout(() => {
+      void check().then((update) => {
+        if (!alive) {
+          void update?.close();
+          return;
+        }
+        if (update) setAvailableUpdate(update);
+      }).catch((reason: unknown) => {
+        console.warn("Не удалось проверить обновления easyPTO", reason);
+      });
+    }, 1200);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  const dismissUpdate = async () => {
+    await availableUpdate?.close();
+    setAvailableUpdate(null);
+    setUpdateError(null);
+  };
+
+  const installAvailableUpdate = async () => {
+    if (!availableUpdate) return;
+    setInstallingUpdate(true);
+    setUpdateError(null);
+    try {
+      await availableUpdate.downloadAndInstall();
+      await relaunch();
+    } catch (reason) {
+      setUpdateError(reason instanceof Error ? reason.message : String(reason));
+      setInstallingUpdate(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setSnapshot(null);
+      return;
+    }
+    let alive = true;
+    setLoading(true);
+    setError(null);
+    invoke<ProjectSnapshot>("get_project_snapshot", { projectId: selectedProjectId })
+      .then((result) => {
+        if (!alive) return;
+        setSnapshot(result);
+        setSelectedLayerId((current) => result.layers.some((layer) => layer.id === current) ? current : result.layers[0]?.id ?? "");
+        localStorage.setItem("easypto.activeProjectId", selectedProjectId);
+      })
+      .catch((reason: unknown) => {
+        if (alive) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [selectedProjectId]);
+
+  const selectedProject = snapshot?.project ?? projects.find((project) => project.id === selectedProjectId) ?? null;
+  const selectedLayer = snapshot?.layers.find((layer) => layer.id === selectedLayerId) ?? null;
+  const currentFilterPosition = markerPosition(search, selectedProject);
+
+  const visibleLayers = useMemo(() => {
+    const allLayers = snapshot?.layers ?? [];
+    if (filter === "unfinished") return allLayers.filter((layer) => layer.remainingLengthCentiPk > 0);
+    if (filter === "behind") return allLayers.filter((layer) => layer.planDeltaPp !== null && layer.planDeltaPp < 0);
+    return allLayers;
+  }, [filter, snapshot]);
+
+  const bridgeArea = snapshot?.workAreas.find((area) => area.id === snapshot.bridgeAreaId) ?? null;
+  const bridgeLayers = bridgeArea ? snapshot?.layers.filter((layer) => layer.workAreaIds.includes(bridgeArea.id)) ?? [] : [];
+  const bridgeLength = bridgeArea ? intervalLength(bridgeArea.intervals) : 0;
+  const bridgeCovered = bridgeArea ? bridgeLayers.reduce((total, layer) => {
+    const areaCoverage = intersectIntervals(
+      mergeIntervals(layer.segments.filter((segment) => segment.workAreaId === bridgeArea.id).map((segment) => ({ fromCentiPk: segment.fromCentiPk, toCentiPk: segment.toCentiPk }))),
+      bridgeArea.intervals,
+    );
+    const excluded = snapshot?.exclusions.filter((exclusion) => exclusion.appliesToLayerIds.includes(layer.id) && exclusion.workAreaIds.includes(bridgeArea.id)).flatMap((exclusion) => exclusion.intervals) ?? [];
+    return total + intervalLength(subtractIntervals(areaCoverage, excluded));
+  }, 0) : 0;
+  const bridgeTotal = bridgeLength * bridgeLayers.length;
+  const bridgeImpactNow = snapshot ? areaProgress(snapshot, snapshot.bridgeAreaId, snapshot.bridgeEnabled) : { covered: 0, total: 0, percent: 0 };
+  const bridgeImpactNext = bridgePreview ? areaProgress(bridgePreview, bridgePreview.bridgeAreaId, bridgePreview.bridgeEnabled) : { covered: 0, total: 0, percent: 0 };
+
+  const adoptSnapshot = (updated: ProjectSnapshot) => {
+    setSnapshot(updated);
+    setSelectedProjectId(updated.project.id);
+    setProjects((current) => [updated.project, ...current.filter((project) => project.id !== updated.project.id)]);
+  };
+
+  const createProject = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await invoke<ProjectSnapshot>("create_project", {
+        name: projectName,
+        routeStartPk,
+        routeEndPk,
+      });
+      adoptSnapshot(result);
+      await refreshProjects();
+      setSelectedLayerId(result.layers[0]?.id ?? "");
+      setProjectDialogOpen(false);
+      setProjectName("");
+      setNotice("Объект создан. Начальные слои готовы к настройке.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const beginCreateLayer = () => {
+    setEditingLayerId(null);
+    setLayerForm(emptyLayerForm(snapshot?.layers.length ?? 0));
+    setLayerEditorOpen(true);
+    setSegmentEditorOpen(false);
+    setError(null);
+  };
+
+  const beginEditLayer = (layer: LayerSnapshot) => {
+    setEditingLayerId(layer.id);
+    setLayerForm({
+      code: layer.code,
+      name: layer.name,
+      color: layer.color,
+      sortOrder: String(layer.sortOrder),
+      baseLayerId: layer.baseLayerId ?? "",
+      planPercent: layer.planPercent === null ? "" : String(layer.planPercent).replace(".", ","),
+      planDate: layer.planDate ?? "",
+    });
+    setLayerEditorOpen(true);
+    setSegmentEditorOpen(false);
+    setError(null);
+  };
+
+  const submitLayer = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const planPercent = layerForm.planPercent.trim() === "" ? null : Number(layerForm.planPercent.replace(",", "."));
+      if ((planPercent === null) !== (layerForm.planDate === "")) {
+        setError("Для плана укажите и процент, и дату.");
+        setSaving(false);
+        return;
+      }
+      if (planPercent !== null && (!Number.isFinite(planPercent) || planPercent < 0 || planPercent > 100)) {
+        setError("Плановый процент должен быть от 0 до 100.");
+        setSaving(false);
+        return;
+      }
+      const input: LayerInput = {
+        code: layerForm.code,
+        name: layerForm.name,
+        color: layerForm.color,
+        sortOrder: Number(layerForm.sortOrder),
+        baseLayerId: layerForm.baseLayerId || null,
+        planPercent,
+        planDate: layerForm.planDate || null,
+      };
+      const command = editingLayerId ? "update_layer" : "create_layer";
+      const updated = await invoke<ProjectSnapshot>(command, {
+        projectId: selectedProjectId,
+        ...(editingLayerId ? { layerId: editingLayerId } : {}),
+        input,
+      });
+      adoptSnapshot(updated);
+      if (!editingLayerId) {
+        const newLayer = updated.layers.find((layer) => !snapshot?.layers.some((old) => old.id === layer.id));
+        if (newLayer) setSelectedLayerId(newLayer.id);
+      }
+      await refreshProjects();
+      setLayerEditorOpen(false);
+      setNotice(editingLayerId ? "Параметры слоя сохранены." : "Слой добавлен.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeLayer = async (layer: LayerSnapshot) => {
+    if (!selectedProjectId) return;
+    const message = layer.segments.length
+      ? `Удалить слой «${layer.name}» и ${layer.segments.length} ${layer.segments.length === 1 ? "отрезок" : "отрезка/отрезков"}? Данные слоя будут удалены.`
+      : `Удалить слой «${layer.name}»?`;
+    if (!window.confirm(message)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("delete_layer", { projectId: selectedProjectId, layerId: layer.id });
+      adoptSnapshot(updated);
+      setSelectedLayerId(updated.layers[0]?.id ?? "");
+      setLayerEditorOpen(false);
+      await refreshProjects();
+      setNotice("Слой удалён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const beginCreateSegment = () => {
+    setEditingSegmentId(null);
+    const defaultArea = snapshot?.workAreas.find((area) => selectedLayer?.workAreaIds.includes(area.id) && (snapshot.bridgeEnabled || area.kind !== "bridge"));
+    setSegmentForm(emptySegmentForm(defaultArea?.id ?? ""));
+    setSegmentEditorOpen(true);
+    setLayerEditorOpen(false);
+    setError(null);
+  };
+
+  const beginEditSegment = (segment: Segment) => {
+    setEditingSegmentId(segment.id);
+    setSegmentForm({
+      workAreaId: segment.workAreaId,
+      fromPk: formatPk(segment.fromCentiPk),
+      toPk: formatPk(segment.toCentiPk),
+      workDate: segment.workDate,
+      note: segment.note ?? "",
+    });
+    setSegmentEditorOpen(true);
+    setLayerEditorOpen(false);
+    setError(null);
+  };
+
+  const submitSegment = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProjectId || !selectedLayer) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const input: SegmentInput = {
+        ...segmentForm,
+        note: segmentForm.note.trim() || null,
+      };
+      const updated = await invoke<ProjectSnapshot>("save_segment", {
+        projectId: selectedProjectId,
+        layerId: selectedLayer.id,
+        segmentId: editingSegmentId,
+        input,
+      });
+      adoptSnapshot(updated);
+      await refreshProjects();
+      setSegmentEditorOpen(false);
+      setNotice(editingSegmentId ? "Отрезок обновлён." : "Отрезок сохранён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeSegment = async (segment: Segment) => {
+    if (!selectedProjectId || !selectedLayer) return;
+    if (!window.confirm(`Удалить отрезок ${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК?`)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("delete_segment", {
+        projectId: selectedProjectId,
+        layerId: selectedLayer.id,
+        segmentId: segment.id,
+      });
+      adoptSnapshot(updated);
+      await refreshProjects();
+      setNotice("Отрезок удалён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const closeLayerEditor = () => { setLayerEditorOpen(false); setError(null); };
+  const closeSegmentEditor = () => { setSegmentEditorOpen(false); setError(null); };
+
+  const beginBridgeSettings = () => {
+    const area = snapshot?.workAreas.find((item) => item.id === snapshot.bridgeAreaId);
+    const interval = area?.intervals[0];
+    const routeLength = (snapshot?.project.routeEnd ?? 0) - (snapshot?.project.routeStart ?? 0);
+    setBridgeForm({
+      enabled: snapshot?.bridgeEnabled ?? false,
+      fromPk: interval ? formatPk(interval.fromCentiPk) : formatPk((snapshot?.project.routeStart ?? 0) + Math.round(routeLength * 0.2)),
+      toPk: interval ? formatPk(interval.toCentiPk) : formatPk((snapshot?.project.routeStart ?? 0) + Math.round(routeLength * 0.8)),
+      layerIds: area ? snapshot?.layers.filter((layer) => layer.workAreaIds.includes(area.id)).map((layer) => layer.id) ?? [] : snapshot?.layers.map((layer) => layer.id) ?? [],
+    });
+    setBridgePreview(null);
+    setBridgeSettingsOpen(true);
+    setError(null);
+  };
+
+  const previewBridge = async () => {
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const preview = await invoke<ProjectSnapshot>("preview_bridge_config", {
+        projectId: selectedProjectId,
+        input: bridgeForm,
+      });
+      setBridgePreview(preview);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setBridgePreview(null);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveBridge = async () => {
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("configure_bridge", {
+        projectId: selectedProjectId,
+        input: bridgeForm,
+      });
+      adoptSnapshot(updated);
+      await refreshProjects();
+      setBridgeSettingsOpen(false);
+      setBridgePreview(null);
+      setNotice(bridgeForm.enabled ? "Настройки моста сохранены." : "Мост отключён. Его настройки и записи сохранены.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const beginCreateExclusion = () => {
+    setExclusionForm({ ...emptyExclusionForm(), layerIds: snapshot?.layers.map((layer) => layer.id) ?? [], workAreaIds: snapshot?.workAreas.filter((area) => area.kind !== "bridge" || snapshot.bridgeEnabled).map((area) => area.id) ?? [] });
+    setExclusionEditorOpen(true);
+    setError(null);
+  };
+
+  const beginEditExclusion = (exclusion: Exclusion) => {
+    setExclusionForm({
+      id: exclusion.id,
+      name: exclusion.name,
+      reason: exclusion.reason,
+      fromPk: exclusion.intervals[0] ? formatPk(exclusion.intervals[0].fromCentiPk) : "",
+      toPk: exclusion.intervals[0] ? formatPk(exclusion.intervals[0].toCentiPk) : "",
+      layerIds: exclusion.appliesToLayerIds,
+      workAreaIds: exclusion.workAreaIds,
+    });
+    setExclusionEditorOpen(true);
+    setError(null);
+  };
+
+  const saveExclusion = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("save_exclusion", {
+        projectId: selectedProjectId,
+        exclusionId: exclusionForm.id,
+        input: { name: exclusionForm.name, reason: exclusionForm.reason, fromPk: exclusionForm.fromPk, toPk: exclusionForm.toPk, layerIds: exclusionForm.layerIds, workAreaIds: exclusionForm.workAreaIds },
+      });
+      adoptSnapshot(updated);
+      setExclusionEditorOpen(false);
+      setExclusionForm(emptyExclusionForm());
+      setNotice(exclusionForm.id ? "Исключение обновлено; показатели пересчитаны." : "Исключённый диапазон добавлен; показатели пересчитаны.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeExclusion = async (exclusion: Exclusion) => {
+    if (!selectedProjectId || !window.confirm(`Удалить исключение «${exclusion.name}»?`)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("delete_exclusion", { projectId: selectedProjectId, exclusionId: exclusion.id });
+      adoptSnapshot(updated);
+      setNotice("Исключение удалено; показатели пересчитаны.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveWorkArea = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("create_work_area", { projectId: selectedProjectId, input: workAreaForm });
+      adoptSnapshot(updated);
+      setWorkAreaEditorOpen(false);
+      setWorkAreaForm({ name: "", fromPk: "", toPk: "", layerIds: [] });
+      setNotice("Рабочая область добавлена; показатели пересчитаны.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeWorkArea = async (area: WorkArea) => {
+    if (!selectedProjectId) return;
+    const segmentCount = snapshot?.layers.reduce((count, layer) => count + layer.segments.filter((segment) => segment.workAreaId === area.id).length, 0) ?? 0;
+    const message = segmentCount ? `Удалить область «${area.name}» и связанные отрезки (${segmentCount})?` : `Удалить рабочую область «${area.name}»?`;
+    if (!window.confirm(message)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("delete_custom_work_area", { projectId: selectedProjectId, workAreaId: area.id });
+      adoptSnapshot(updated);
+      setNotice("Рабочая область удалена; показатели пересчитаны.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const canExportCurrentSnapshot = () => Boolean(snapshot && snapshot.project.id === selectedProjectId && !saving && !error);
+  const openReportPreview = () => {
+    if (!canExportCurrentSnapshot()) return;
+    setReportDialogOpen(true);
+  };
+
+  const runExport = async (format: "excel" | "word") => {
+    if (!canExportCurrentSnapshot() || !snapshot) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const saved = format === "excel"
+        ? await exportExcel(snapshot as ReportSnapshot)
+        : await exportWord(snapshot as ReportSnapshot);
+      if (saved) setNotice(format === "excel" ? "Файл Excel сохранён." : "Файл Word сохранён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="application">
+      <header className="topbar">
+        <a className="brand" href="#workspace" aria-label="easyPTO — рабочая область">
+          <span className="brand-emblem" aria-hidden="true"><span /><span /><span /></span>
+          <span className="brand-word">easy<span>PTO</span></span>
+        </a>
+        <div className="topbar-divider" />
+        <label className="object-context">
+          <span className="context-label">ОБЪЕКТ</span>
+          <select className="object-select" aria-label="Выбрать объект" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={!projects.length}>
+            {!projects.length && <option value="">Нет объектов</option>}
+            {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+          </select>
+        </label>
+        <button className="new-project-button" type="button" onClick={() => setProjectDialogOpen(true)} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
+        <div className="topbar-spacer" />
+        <div className={`save-state${saving ? " is-saving" : ""}${error ? " is-error" : ""}`} aria-live="polite">
+          <span className="save-dot" />
+          <span>{saving ? "Сохранение…" : error ? "Есть ошибка" : snapshot ? "Сохранено" : "Локальный проект"}</span>
+        </div>
+        <div className="topbar-divider topbar-divider-short" />
+        <div className={`database-state${error && !snapshot ? " is-error" : ""}`} title={error && !snapshot ? error : `Локальная база · схема ${databaseStatus?.schemaVersion ?? "…"}`}>
+          <DatabaseIcon />
+          <span>{databaseStatus ? "Локально" : loading ? "Подключение…" : "База недоступна"}</span>
+        </div>
+        <button className="report-button" type="button" onClick={openReportPreview} disabled={!snapshot || saving || Boolean(error)} title={error ? "Сначала устраните ошибку сохранения" : "Предпросмотр и печать PDF-отчёта"}><DocumentIcon /><span>Отчёт</span></button>
+      </header>
+
+      <div className="workspace" id="workspace">
+        <aside className="sidebar" aria-label="Разделы приложения">
+          <div className="sidebar-caption">РАБОЧЕЕ МЕСТО</div>
+          <div className="nav-item active" aria-current="page"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></div>
+          <div className="sidebar-bottom"><span className="local-indicator" /><span>Работа офлайн</span></div>
+        </aside>
+
+        <main className="main-content">
+          {loading && !snapshot ? <LoadingState /> : !snapshot ? (
+            <EmptyProjectState error={error} onCreate={() => setProjectDialogOpen(true)} />
+          ) : (
+            <>
+              <div className="page-heading">
+                <div>
+                  <div className="breadcrumb"><span>{snapshot.project.name}</span><span className="crumb-separator">/</span><strong>Слои дорожной одежды</strong></div>
+                  <div className="heading-row"><h1>Слои дорожной одежды</h1><span className="layer-total">{snapshot.layers.length} технологических слоёв</span></div>
+                </div>
+                <div className="page-heading-actions"><button className="quiet-button" type="button" onClick={openHistory}>История и копии</button><details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details><details className="export-menu" onClick={(event) => { if ((event.target as HTMLElement).closest("button")) event.currentTarget.open = false; }}><summary><ExportIcon /> Экспорт</summary><div><button type="button" onClick={() => runExport("excel")} disabled={!canExportCurrentSnapshot()}>Excel (.xlsx)</button><button type="button" onClick={() => runExport("word")} disabled={!canExportCurrentSnapshot()}>Word (.docx)</button><button type="button" onClick={openReportPreview} disabled={!canExportCurrentSnapshot()}>PDF / печать</button></div></details></div>
+              </div>
+
+              {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
+              {notice && <div className="inline-message success-message" role="status"><CheckIcon />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="Закрыть сообщение">×</button></div>}
+
+              <section className="route-card" aria-label="Паспорт трассы">
+                <div className="route-title"><span className="route-icon"><RouteIcon /></span><div><h2>Паспорт трассы</h2><span>{snapshot.project.name}</span></div></div>
+                <div className="route-field"><span className="field-label">НАЧАЛО</span><strong className="mono">{formatPk(snapshot.project.routeStart)} <small>ПК</small></strong></div>
+                <div className="route-arrow" aria-hidden="true">→</div>
+                <div className="route-field"><span className="field-label">КОНЕЦ</span><strong className="mono">{formatPk(snapshot.project.routeEnd)} <small>ПК</small></strong></div>
+                <div className="route-field route-length"><span className="field-label">ДЛИНА ТРАССЫ</span><strong className="mono">{formatNumber((snapshot.project.routeEnd - snapshot.project.routeStart) / 1000, 3)} <small>км</small></strong></div>
+              </section>
+
+              <section className="summary-strip" aria-label="Сводка объекта">
+                <article className="summary-item summary-primary"><div className="summary-label"><span className="summary-mark progress-mark" />ВЫПОЛНЕНИЕ ПО СЛОЯМ</div><div className="summary-value">{roundedPercent(snapshot.summary.progressPercent)}<span>%</span></div><div className="summary-detail">{formatNumber(snapshot.summary.coveredLengthCentiPk / 1000)} из {formatNumber(snapshot.summary.workAreaLengthCentiPk / 1000)} <span>км·слоёв</span></div></article>
+                <article className="summary-item"><div className="summary-label"><span className="summary-mark remaining-mark" />ОСТАЛОСЬ ВЫПОЛНИТЬ</div><div className="summary-value">{formatNumber(snapshot.summary.remainingLengthCentiPk / 1000)}<span>км·слоёв</span></div><div className="summary-detail">сумма по применимым слоям</div></article>
+                <article className="summary-item"><div className="summary-label"><span className="summary-mark behind-mark" />НИЖЕ ПЛАНА</div><div className="summary-value">{snapshot.summary.layersBehindPlan}<span>слоя</span></div><div className="summary-detail">план сравнивается в п.п.</div></article>
+                <div className="summary-explainer"><span className="equation-icon">Σ</span><span>Учитывается каждый слой отдельно.<br />Физическая длина трассы — <strong>{formatNumber((snapshot.project.routeEnd - snapshot.project.routeStart) / 1000, 3)} км</strong>.</span></div>
+              </section>
+
+              <section className="layers-panel" aria-labelledby="layers-title">
+                <div className="panel-heading"><div><h2 id="layers-title">Выполнение по пикетажу</h2><p>Факт, план и доступный фронт на общей шкале трассы</p></div><div className="layer-actions"><button className="compact-button active-action" type="button" onClick={beginCreateLayer}><PlusIcon /> Добавить слой</button></div></div>
+                <div className="table-toolbar">
+                  <label className="search-box"><SearchIcon /><input aria-label="Найти пикет" type="text" inputMode="decimal" placeholder={`Найти ПК, ${formatPk(snapshot.project.routeStart)}`} value={search} onChange={(event) => setSearch(event.currentTarget.value)} onFocus={() => setSearchFocused(true)} onBlur={() => setSearchFocused(false)} />{search && <button className="clear-search" type="button" onClick={() => setSearch("")} aria-label="Очистить поиск">×</button>}</label>
+                  <div className="filter-group" role="group" aria-label="Фильтр слоёв">
+                    <button className={filter === "all" ? "filter-button selected" : "filter-button"} onClick={() => setFilter("all")} type="button">Все <span>{snapshot.layers.length}</span></button>
+                    <button className={filter === "unfinished" ? "filter-button selected" : "filter-button"} onClick={() => setFilter("unfinished")} type="button">Незавершённые</button>
+                    <button className={filter === "behind" ? "filter-button selected" : "filter-button"} onClick={() => setFilter("behind")} type="button">Ниже плана <span>{snapshot.summary.layersBehindPlan}</span></button>
+                  </div>
+                  <span className="table-result-count">{visibleLayers.length} из {snapshot.layers.length}</span>
+                </div>
+
+                <div className="table-scroll">
+                  <div className="layer-grid table-head"><div className="head-layer">СЛОЙ</div><div className="head-fact">ФАКТ</div><div className="head-plan">ПЛАН · ДАТА</div><div className="head-delta">Δ П.П.</div><div className="head-front">ФРОНТ</div><div className="head-scale"><div className="scale-title">ПИКЕТАЖНАЯ ШКАЛА</div><div className="scale-values mono">{[0, 25, 50, 75, 100].map((fraction) => <span key={fraction}>{formatPk(Math.round(snapshot.project.routeStart + (snapshot.project.routeEnd - snapshot.project.routeStart) * fraction / 100))}{fraction === 100 ? " ПК" : ""}</span>)}</div></div></div>
+                  <div className="layer-list">
+                    {visibleLayers.map((layer) => <LayerRow key={layer.id} layer={layer} project={snapshot.project} searchPosition={currentFilterPosition} selected={selectedLayerId === layer.id} onSelect={() => { setSelectedLayerId(layer.id); setLayerEditorOpen(false); setSegmentEditorOpen(false); }} />)}
+                    {!visibleLayers.length && <div className="empty-filter"><span className="empty-icon">✓</span><strong>Под фильтр не попали слои</strong><span>Смените фильтр или добавьте новый слой.</span></div>}
+                  </div>
+                </div>
+                {search && currentFilterPosition === null && <p className="search-hint" role="status">Введите координату в границах трассы с точностью до 0,01 ПК.</p>}
+                {searchFocused && currentFilterPosition !== null && <div className="search-result"><span className="search-result-marker" />ПК {search.trim()} отмечен на шкале трассы.</div>}
+                <footer className="panel-footer"><div className="legend"><span><i className="legend-complete" />Выполнено</span><span><i className="legend-front" />Доступный фронт</span><span><i className="legend-track" />Граница трассы</span></div><span className="footer-note"><InfoIcon /> Полосы показаны в масштабе всей трассы</span></footer>
+              </section>
+
+              {selectedLayer && <section className="layer-detail" aria-labelledby="selected-layer-title">
+                <div className="detail-heading"><div className="detail-title-wrap"><span className="layer-swatch large" style={{ "--layer-color": selectedLayer.color } as CSSProperties} /><div><div className="field-label">ВЫБРАННЫЙ СЛОЙ · {selectedLayer.code}</div><h2 id="selected-layer-title">{selectedLayer.name}</h2></div></div><div className="detail-actions"><button className="quiet-button" type="button" onClick={() => beginEditLayer(selectedLayer)}><EditIcon /> Изменить слой</button><button className="compact-button active-action" type="button" onClick={beginCreateSegment}><PlusIcon /> Добавить отрезок</button></div></div>
+                <div className="detail-metrics"><div><span>ФАКТ</span><strong>{roundedPercent(selectedLayer.progressPercent)}%</strong><small>{formatKm(selectedLayer.coveredLengthCentiPk)} из {formatKm(selectedLayer.workAreaLengthCentiPk)}</small></div><div><span>ОСТАЛОСЬ</span><strong>{formatKm(selectedLayer.remainingLengthCentiPk)}</strong><small>в рабочей области слоя</small></div><div><span>ФРОНТ</span><strong>{formatKm(selectedLayer.frontLengthCentiPk)}</strong><small>{selectedLayer.baseLayerId ? `по базовому слою «${snapshot.layers.find((layer) => layer.id === selectedLayer.baseLayerId)?.name ?? ""}»` : "по всей рабочей области"}</small></div><div><span>ПЛАН</span><strong>{selectedLayer.planPercent === null ? "Не задан" : `${formatNumber(selectedLayer.planPercent, 1)}%`}</strong><small>{selectedLayer.planDate ? `на ${formatDate(selectedLayer.planDate)}` : "укажите процент и дату"}</small></div></div>
+
+                {layerEditorOpen && <form className="editor-form layer-form" onSubmit={submitLayer}>
+                  <div className="form-title"><div><h3>{editingLayerId ? "Параметры слоя" : "Новый слой"}</h3><p>Связь с базовым слоем задаётся явно и не меняется при сортировке.</p></div><button className="close-editor" type="button" onClick={closeLayerEditor} aria-label="Закрыть редактор">×</button></div>
+                  <div className="form-grid layer-form-grid">
+                    <label>Код<input required maxLength={16} value={layerForm.code} onChange={(event) => setLayerForm({ ...layerForm, code: event.currentTarget.value })} /></label>
+                    <label>Название слоя<input required value={layerForm.name} onChange={(event) => setLayerForm({ ...layerForm, name: event.currentTarget.value })} /></label>
+                    <label>Цвет<span className="color-input"><input type="color" value={layerForm.color} onChange={(event) => setLayerForm({ ...layerForm, color: event.currentTarget.value })} /><span className="mono">{layerForm.color.toUpperCase()}</span></span></label>
+                    <label>Порядок<input required type="number" min="0" step="1" value={layerForm.sortOrder} onChange={(event) => setLayerForm({ ...layerForm, sortOrder: event.currentTarget.value })} /></label>
+                    <label>Базовый слой<select value={layerForm.baseLayerId} onChange={(event) => setLayerForm({ ...layerForm, baseLayerId: event.currentTarget.value })}><option value="">Нет · вся рабочая область</option>{snapshot.layers.filter((layer) => layer.id !== editingLayerId).map((layer) => <option key={layer.id} value={layer.id}>{layer.name}</option>)}</select></label>
+                    <label>План, %<input inputMode="decimal" placeholder="0–100" value={layerForm.planPercent} onChange={(event) => setLayerForm({ ...layerForm, planPercent: event.currentTarget.value })} /></label>
+                    <label>Дата плана<input type="date" value={layerForm.planDate} onChange={(event) => setLayerForm({ ...layerForm, planDate: event.currentTarget.value })} /></label>
+                  </div>
+                  <div className="form-footer"><span className="form-hint">План задаётся вместе с датой.</span><div><button className="quiet-button" type="button" onClick={closeLayerEditor}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Сохранить слой"}</button>{editingLayerId && <button className="danger-button" type="button" disabled={saving} onClick={() => removeLayer(selectedLayer)}>Удалить слой</button>}</div></div>
+                </form>}
+
+                <div className="segment-section"><div className="segment-heading"><div><h3>Отрезки работ</h3><span>{selectedLayer.segments.length} записей · длина вычисляется по координатам</span></div>{!layerEditorOpen && <button className="compact-button active-action" type="button" onClick={beginCreateSegment}><PlusIcon /> Добавить отрезок</button>}</div>
+                  {segmentEditorOpen && <form className="editor-form segment-form" onSubmit={submitSegment}>
+                    <div className="form-title"><div><h3>{editingSegmentId ? "Изменить отрезок" : "Новый отрезок"}</h3><p>Пересечения в одном слое и рабочей области не сохраняются.</p></div><button className="close-editor" type="button" onClick={closeSegmentEditor} aria-label="Закрыть редактор">×</button></div>
+                    <div className="form-grid segment-form-grid">
+                      <label>Рабочая область<select required value={segmentForm.workAreaId} onChange={(event) => setSegmentForm({ ...segmentForm, workAreaId: event.currentTarget.value })}>{snapshot.workAreas.filter((area) => selectedLayer.workAreaIds.includes(area.id) && (snapshot.bridgeEnabled || area.kind !== "bridge" || area.id === segmentForm.workAreaId)).map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}</select></label>
+                      <label>От, ПК<input required inputMode="decimal" placeholder="0,00" value={segmentForm.fromPk} onChange={(event) => setSegmentForm({ ...segmentForm, fromPk: event.currentTarget.value })} /></label>
+                      <label>До, ПК<input required inputMode="decimal" placeholder="0,00" value={segmentForm.toPk} onChange={(event) => setSegmentForm({ ...segmentForm, toPk: event.currentTarget.value })} /></label>
+                      <label>Дата выполнения<input required type="date" value={segmentForm.workDate} onChange={(event) => setSegmentForm({ ...segmentForm, workDate: event.currentTarget.value })} /></label>
+                      <label className="note-field">Комментарий<textarea rows={2} maxLength={2000} value={segmentForm.note} onChange={(event) => setSegmentForm({ ...segmentForm, note: event.currentTarget.value })} placeholder="Необязательно" /></label>
+                    </div>
+                    <div className="form-footer"><span className="form-hint">Интервал включает начало и не включает конец: [от, до).</span><div><button className="quiet-button" type="button" onClick={closeSegmentEditor}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Сохранить отрезок"}</button></div></div>
+                  </form>}
+                  {!selectedLayer.segments.length && !segmentEditorOpen ? <div className="empty-segments"><span className="empty-icon">＋</span><strong>Пока нет отрезков</strong><span>Добавьте выполненный участок с датой и координатами.</span><button className="quiet-button" type="button" onClick={beginCreateSegment}><PlusIcon /> Добавить первый отрезок</button></div> : null}
+                  {!!selectedLayer.segments.length && <div className="segment-table-wrap"><table className="segment-table"><thead><tr><th>ОТРЕЗОК, ПК</th><th>ДЛИНА</th><th>РАБОЧАЯ ОБЛАСТЬ</th><th>ДАТА</th><th>КОММЕНТАРИЙ</th><th><span className="visually-hidden">Действия</span></th></tr></thead><tbody>{selectedLayer.segments.map((segment) => <tr key={segment.id}><td className="mono">{formatPk(segment.fromCentiPk)} — {formatPk(segment.toCentiPk)}</td><td className="mono">{formatKm(segment.toCentiPk - segment.fromCentiPk)}</td><td>{snapshot.workAreas.find((area) => area.id === segment.workAreaId)?.name ?? "Рабочая область"}</td><td>{segment.workDate}</td><td className="segment-note">{segment.note || <span className="muted-dash">—</span>}</td><td className="segment-actions"><button type="button" onClick={() => beginEditSegment(segment)} aria-label={`Изменить отрезок ${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК`}><EditIcon /></button><button type="button" onClick={() => removeSegment(segment)} aria-label={`Удалить отрезок ${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК`}><TrashIcon /></button></td></tr>)}</tbody></table></div>}
+                </div>
+              </section>}
+
+              <section className="work-area-panel" aria-labelledby="work-area-title">
+                <div className="work-area-heading"><div><h2 id="work-area-title">Рабочие области и исключения</h2><p>Области задают применимость слоёв; исключённые диапазоны вычитаются из расчёта.</p></div><button className="compact-button active-action" type="button" onClick={beginBridgeSettings}>{snapshot.bridgeEnabled ? "Настроить мост" : "Настроить мост…"}</button></div>
+                {snapshot.bridgeEnabled && bridgeArea && <div className="bridge-summary">
+                  <div className="bridge-summary-title"><span className="bridge-mark" /> <strong>Мост</strong><span className="mono">{bridgeArea.intervals.map((interval) => `${formatPk(interval.fromCentiPk)}–${formatPk(interval.toCentiPk)} ПК`).join(", ")}</span></div>
+                  <div className="bridge-progress"><strong>{bridgeTotal ? roundedPercent(bridgeCovered * 100 / bridgeTotal) : "0,0"}%</strong><span>{formatKm(bridgeCovered)} из {formatKm(bridgeTotal)} по применимым слоям</span></div>
+                  <div className="bridge-lanes" aria-label="Выполнение слоёв в границах моста">
+                    {bridgeLayers.map((layer) => {
+                      const coverage = intersectIntervals(mergeIntervals(layer.segments.filter((segment) => segment.workAreaId === bridgeArea.id).map((segment) => ({ fromCentiPk: segment.fromCentiPk, toCentiPk: segment.toCentiPk }))), bridgeArea.intervals);
+                      const excluded = snapshot.exclusions.filter((exclusion) => exclusion.appliesToLayerIds.includes(layer.id) && exclusion.workAreaIds.includes(bridgeArea.id)).flatMap((exclusion) => exclusion.intervals);
+                      const effective = subtractIntervals(coverage, excluded);
+                      return <div className="bridge-lane" key={layer.id}><span className="layer-swatch" style={{ "--layer-color": layer.color } as CSSProperties} /><span className="bridge-lane-name">{layer.name}</span><div className="bridge-lane-track">{bridgeArea.intervals.map((interval, index) => <span key={`scope-${index}`} className="bridge-scope" style={{ left: `${((interval.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((interval.toCentiPk - interval.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%` }} />)}{effective.map((interval, index) => <span key={`covered-${index}`} className="bridge-covered" style={{ left: `${((interval.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((interval.toCentiPk - interval.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, "--layer-color": layer.color } as CSSProperties} />)}</div><span className="mono bridge-lane-value">{formatKm(intervalLength(effective))}</span></div>;
+                    })}
+                  </div>
+                </div>}
+                <div className="custom-area-heading"><div><h3>Пользовательские области</h3><span>{snapshot.workAreas.filter((area) => area.kind === "custom").length} именованных диапазонов</span></div>{!workAreaEditorOpen && <button className="compact-button active-action" type="button" onClick={() => { setWorkAreaForm({ name: "", fromPk: formatPk(snapshot.project.routeStart), toPk: formatPk(snapshot.project.routeEnd), layerIds: snapshot.layers.map((layer) => layer.id) }); setWorkAreaEditorOpen(true); }}>Добавить область</button>}</div>
+                {workAreaEditorOpen && <form className="work-area-editor custom-area-editor" onSubmit={saveWorkArea}>
+                  <div className="form-title"><div><h3>Новая рабочая область</h3><p>Назовите диапазон и отметьте слои, которым он доступен.</p></div><button className="close-editor" type="button" onClick={() => setWorkAreaEditorOpen(false)} aria-label="Закрыть форму области">×</button></div>
+                  <div className="custom-area-inputs"><label>Название<input required value={workAreaForm.name} onChange={(event) => setWorkAreaForm({ ...workAreaForm, name: event.currentTarget.value })} placeholder="Например, съезд 1" /></label><label>Начало, ПК<input required inputMode="decimal" value={workAreaForm.fromPk} onChange={(event) => setWorkAreaForm({ ...workAreaForm, fromPk: event.currentTarget.value })} /></label><label>Конец, ПК<input required inputMode="decimal" value={workAreaForm.toPk} onChange={(event) => setWorkAreaForm({ ...workAreaForm, toPk: event.currentTarget.value })} /></label></div>
+                  <fieldset className="choice-fieldset"><legend>Применяется к слоям</legend><div>{snapshot.layers.map((layer) => <label key={layer.id}><input type="checkbox" checked={workAreaForm.layerIds.includes(layer.id)} onChange={(event) => setWorkAreaForm({ ...workAreaForm, layerIds: event.currentTarget.checked ? [...workAreaForm.layerIds, layer.id] : workAreaForm.layerIds.filter((id) => id !== layer.id) })} /><span>{layer.name}</span></label>)}</div></fieldset>
+                  <div className="form-footer"><span className="form-hint">Границы и применимость можно удалить и создать заново.</span><div><button className="quiet-button" type="button" onClick={() => setWorkAreaEditorOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Создать область"}</button></div></div>
+                </form>}
+                {!!snapshot.workAreas.filter((area) => area.kind === "custom").length && <div className="custom-area-list">{snapshot.workAreas.filter((area) => area.kind === "custom").map((area) => <article className="custom-area-row" key={area.id}><span className="custom-area-icon">⌖</span><div><strong>{area.name}</strong><span className="mono">{area.intervals.map((interval) => `${formatPk(interval.fromCentiPk)}–${formatPk(interval.toCentiPk)} ПК`).join(", ")}</span></div><span className="exclusion-scope">{snapshot.layers.filter((layer) => layer.workAreaIds.includes(area.id)).length} слоёв</span><button type="button" onClick={() => removeWorkArea(area)}>Удалить</button></article>)}</div>}
+                {bridgeSettingsOpen && <div className="work-area-editor">
+                  <div className="form-title"><div><h3>Настройка моста</h3><p>Мост — отдельная область проекта. Сегменты не копируются, а показатели пересчитываются из записей слоёв.</p></div><button className="close-editor" type="button" onClick={() => { setBridgeSettingsOpen(false); setBridgePreview(null); }} aria-label="Закрыть настройку моста">×</button></div>
+                  <label className="toggle-field"><input type="checkbox" checked={bridgeForm.enabled} onChange={(event) => { setBridgeForm({ ...bridgeForm, enabled: event.currentTarget.checked }); setBridgePreview(null); }} /><span><strong>Использовать мост в этом проекте</strong><small>При отключении настройки и мостовые отрезки сохраняются, но не участвуют в расчётах.</small></span></label>
+                  {bridgeForm.enabled && <>
+                    <div className="bridge-inputs"><label>Начало, ПК<input required inputMode="decimal" value={bridgeForm.fromPk} onChange={(event) => { setBridgeForm({ ...bridgeForm, fromPk: event.currentTarget.value }); setBridgePreview(null); }} /></label><label>Конец, ПК<input required inputMode="decimal" value={bridgeForm.toPk} onChange={(event) => { setBridgeForm({ ...bridgeForm, toPk: event.currentTarget.value }); setBridgePreview(null); }} /></label></div>
+                    <fieldset className="choice-fieldset"><legend>Мост относится к слоям</legend><div>{snapshot.layers.map((layer) => <label key={layer.id}><input type="checkbox" checked={bridgeForm.layerIds.includes(layer.id)} onChange={(event) => setBridgeForm({ ...bridgeForm, layerIds: event.currentTarget.checked ? [...bridgeForm.layerIds, layer.id] : bridgeForm.layerIds.filter((id) => id !== layer.id) })} /><span>{layer.name}</span></label>)}</div></fieldset>
+                  </>}
+                  {bridgePreview && <div className="preview-impact" role="status"><strong>Предварительный пересчёт</strong><span>Объект: {roundedPercent(snapshot.summary.progressPercent)}% → {roundedPercent(bridgePreview.summary.progressPercent)}%</span><span>Учтено: {formatKm(snapshot.summary.coveredLengthCentiPk)} → {formatKm(bridgePreview.summary.coveredLengthCentiPk)}</span><span>Осталось: {formatKm(snapshot.summary.remainingLengthCentiPk)} → {formatKm(bridgePreview.summary.remainingLengthCentiPk)}</span><span>Мост: {roundedPercent(bridgeImpactNow.percent)}% ({formatKm(bridgeImpactNow.covered)} / {formatKm(bridgeImpactNow.total)}) → {roundedPercent(bridgeImpactNext.percent)}% ({formatKm(bridgeImpactNext.covered)} / {formatKm(bridgeImpactNext.total)})</span></div>}
+                  <div className="form-footer"><span className="form-hint">Предварительный просмотр не сохраняет изменения.</span><div><button className="quiet-button" type="button" onClick={previewBridge} disabled={saving}>{saving ? "Расчёт…" : "Предпросмотр"}</button><button className="quiet-button" type="button" onClick={() => { setBridgeSettingsOpen(false); setBridgePreview(null); }}>Отмена</button><button className="primary-button" type="button" onClick={saveBridge} disabled={saving}>{saving ? "Сохранение…" : "Применить"}</button></div></div>
+                </div>}
+                <div className="exclusion-heading"><div><h3>Исключённые диапазоны</h3><span>{snapshot.exclusions.length} настроек · каждый диапазон хранит причину и область применения</span></div>{!exclusionEditorOpen && <button className="compact-button active-action" type="button" onClick={beginCreateExclusion}>Добавить исключение</button>}</div>
+                {exclusionEditorOpen && <form className="work-area-editor exclusion-editor" onSubmit={saveExclusion}>
+                  <div className="form-title"><div><h3>{exclusionForm.id ? "Изменить исключение" : "Новое исключение"}</h3><p>Диапазон исключается только из выбранных слоёв и областей.</p></div><button className="close-editor" type="button" onClick={() => setExclusionEditorOpen(false)} aria-label="Закрыть редактор исключения">×</button></div>
+                  <div className="exclusion-inputs"><label>Название<input required value={exclusionForm.name} onChange={(event) => setExclusionForm({ ...exclusionForm, name: event.currentTarget.value })} placeholder="Например, водопропускная труба" /></label><label>От, ПК<input required inputMode="decimal" value={exclusionForm.fromPk} onChange={(event) => setExclusionForm({ ...exclusionForm, fromPk: event.currentTarget.value })} /></label><label>До, ПК<input required inputMode="decimal" value={exclusionForm.toPk} onChange={(event) => setExclusionForm({ ...exclusionForm, toPk: event.currentTarget.value })} /></label><label className="reason-field">Причина<textarea required rows={2} value={exclusionForm.reason} onChange={(event) => setExclusionForm({ ...exclusionForm, reason: event.currentTarget.value })} /></label></div>
+                  <fieldset className="choice-fieldset"><legend>Области</legend><div>{snapshot.workAreas.filter((area) => area.kind !== "bridge" || snapshot.bridgeEnabled).map((area) => <label key={area.id}><input type="checkbox" checked={exclusionForm.workAreaIds.includes(area.id)} onChange={(event) => setExclusionForm({ ...exclusionForm, workAreaIds: event.currentTarget.checked ? [...exclusionForm.workAreaIds, area.id] : exclusionForm.workAreaIds.filter((id) => id !== area.id) })} /><span>{area.name}</span></label>)}</div></fieldset>
+                  <fieldset className="choice-fieldset"><legend>Слои</legend><div>{snapshot.layers.map((layer) => <label key={layer.id}><input type="checkbox" checked={exclusionForm.layerIds.includes(layer.id)} onChange={(event) => setExclusionForm({ ...exclusionForm, layerIds: event.currentTarget.checked ? [...exclusionForm.layerIds, layer.id] : exclusionForm.layerIds.filter((id) => id !== layer.id) })} /><span>{layer.name}</span></label>)}</div></fieldset>
+                  <div className="form-footer"><span className="form-hint">Длина диапазона вычисляется автоматически.</span><div><button className="quiet-button" type="button" onClick={() => setExclusionEditorOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Сохранить исключение"}</button></div></div>
+                </form>}
+                {!!snapshot.exclusions.length && <div className="exclusion-list">{snapshot.exclusions.map((exclusion) => <article className="exclusion-row" key={exclusion.id}><span className="exclusion-icon" aria-hidden="true">−</span><div><strong>{exclusion.name}</strong><span className="mono">{exclusion.intervals.map((interval) => `${formatPk(interval.fromCentiPk)}–${formatPk(interval.toCentiPk)} ПК`).join(", ")}</span><small>{exclusion.reason}</small></div><span className="exclusion-scope">{exclusion.appliesToLayerIds.length} слоёв · {exclusion.workAreaIds.length} областей</span><div className="exclusion-actions"><button type="button" onClick={() => beginEditExclusion(exclusion)}>Изменить</button><button type="button" onClick={() => removeExclusion(exclusion)}>Удалить</button></div></article>)}</div>}
+              </section>
+
+              {layerEditorOpen && !selectedLayer && <section className="layer-detail" aria-label="Добавить слой">
+                <form className="editor-form layer-form" onSubmit={submitLayer}>
+                  <div className="form-title"><div><h3>Новый слой</h3><p>Связь с базовым слоем задаётся явно и не меняется при сортировке.</p></div><button className="close-editor" type="button" onClick={closeLayerEditor} aria-label="Закрыть редактор">×</button></div>
+                  <div className="form-grid layer-form-grid">
+                    <label>Код<input required maxLength={16} value={layerForm.code} onChange={(event) => setLayerForm({ ...layerForm, code: event.currentTarget.value })} /></label>
+                    <label>Название слоя<input required value={layerForm.name} onChange={(event) => setLayerForm({ ...layerForm, name: event.currentTarget.value })} /></label>
+                    <label>Цвет<span className="color-input"><input type="color" value={layerForm.color} onChange={(event) => setLayerForm({ ...layerForm, color: event.currentTarget.value })} /><span className="mono">{layerForm.color.toUpperCase()}</span></span></label>
+                    <label>Порядок<input required type="number" min="0" step="1" value={layerForm.sortOrder} onChange={(event) => setLayerForm({ ...layerForm, sortOrder: event.currentTarget.value })} /></label>
+                    <label>Базовый слой<select value={layerForm.baseLayerId} onChange={(event) => setLayerForm({ ...layerForm, baseLayerId: event.currentTarget.value })}><option value="">Нет · вся рабочая область</option>{snapshot.layers.map((layer) => <option key={layer.id} value={layer.id}>{layer.name}</option>)}</select></label>
+                    <label>План, %<input inputMode="decimal" placeholder="0–100" value={layerForm.planPercent} onChange={(event) => setLayerForm({ ...layerForm, planPercent: event.currentTarget.value })} /></label>
+                    <label>Дата плана<input type="date" value={layerForm.planDate} onChange={(event) => setLayerForm({ ...layerForm, planDate: event.currentTarget.value })} /></label>
+                  </div>
+                  <div className="form-footer"><span className="form-hint">План задаётся вместе с датой.</span><div><button className="quiet-button" type="button" onClick={closeLayerEditor}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Сохранить слой"}</button></div></div>
+                </form>
+              </section>}
+
+              <div className="workspace-footnote"><span>easyPTO <b>·</b> слои дорожной одежды</span><span>{databaseStatus ? `Схема базы данных ${databaseStatus.schemaVersion}` : "Локальное хранилище"}</span></div>
+            </>
+          )}
+        </main>
+      </div>
+
+      {availableUpdate && <div className="modal-backdrop update-backdrop" role="presentation"><section className="project-dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
+        <div className="dialog-heading"><div><span className="field-label">ОБНОВЛЕНИЕ easyPTO</span><h2 id="update-dialog-title">Доступна новая версия</h2><p>Установить easyPTO {availableUpdate.version}? Приложение закроется и запустится снова после установки.</p></div><button className="close-editor" type="button" onClick={() => void dismissUpdate()} disabled={installingUpdate} aria-label="Позже">×</button></div>
+        {availableUpdate.body && <div className="update-notes">{availableUpdate.body}</div>}
+        {updateError && <div className="inline-message error-message" role="alert"><InfoIcon />Не удалось установить обновление: {updateError}</div>}
+        <div className="form-footer"><span className="form-hint">Версия {availableUpdate.currentVersion} → {availableUpdate.version}</span><div><button className="quiet-button" type="button" onClick={() => void dismissUpdate()} disabled={installingUpdate}>Позже</button><button className="primary-button" type="button" onClick={() => void installAvailableUpdate()} disabled={installingUpdate}>{installingUpdate ? "Загрузка и установка…" : "Установить"}</button></div></div>
+      </section></div>}
+
+      {projectDialogOpen && <div className="modal-backdrop" role="presentation"><form className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title" onSubmit={createProject}>
+        <div className="dialog-heading"><div><span className="field-label">НОВЫЙ ОБЪЕКТ</span><h2 id="project-dialog-title">Создать объект</h2><p>Задайте название и границы трассы. Начальная конфигурация слоёв создастся автоматически.</p></div><button className="close-editor" type="button" onClick={() => setProjectDialogOpen(false)} aria-label="Закрыть">×</button></div>
+        {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
+        <label>Название объекта<input autoFocus required value={projectName} onChange={(event) => setProjectName(event.currentTarget.value)} placeholder="Например, Северный обход" /></label>
+        <div className="dialog-route"><label>Начало трассы, ПК<input required inputMode="decimal" value={routeStartPk} onChange={(event) => setRouteStartPk(event.currentTarget.value)} /></label><span aria-hidden="true">→</span><label>Конец трассы, ПК<input required inputMode="decimal" value={routeEndPk} onChange={(event) => setRouteEndPk(event.currentTarget.value)} /></label></div>
+        <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => setProjectDialogOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Создание…" : "Создать объект"}</button></div>
+      </form></div>}
+      {historyDialogOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setHistoryDialogOpen(false); }}><section className="history-dialog" role="dialog" aria-modal="true" aria-labelledby="history-dialog-title">
+        <div className="dialog-heading"><div><span className="field-label">СОХРАННОСТЬ ДАННЫХ</span><h2 id="history-dialog-title">История и резервные копии</h2><p>Изменения записываются в локальную базу после проверки каждой операции.</p></div><button className="close-editor" type="button" onClick={() => setHistoryDialogOpen(false)} aria-label="Закрыть историю">×</button></div>
+        {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
+        <div className="backup-actions"><div><strong>Резервная копия всей базы</strong><span>Содержит все объекты на этом компьютере.</span></div><button className="primary-button" type="button" onClick={createManualBackup} disabled={saving}>{saving ? "Создание…" : "Создать копию"}</button></div>
+        <div className="history-columns"><section><h3>Последние действия · {snapshot?.project.name}</h3>{snapshot?.journal.length ? <ol className="journal-list">{snapshot.journal.map((item) => <li key={item.id}><span className="journal-dot" /><div><strong>{item.summary}</strong><time>{formatTimestamp(item.happenedAt)}</time></div></li>)}</ol> : <p className="history-empty">Пока нет записей журнала.</p>}</section><section><h3>Резервные копии · {backups.length}</h3>{backups.length ? <div className="backup-list">{backups.map((backup) => <article className="backup-row" key={backup.fileName}><div><strong>{formatTimestamp(backup.createdAt)}</strong><span>{backup.source}</span><small>{backup.projectNames.join(", ") || "Нет объектов"}</small>{backup.diagnostic && <small className="backup-diagnostic">Копию нельзя восстановить: {backup.diagnostic}</small>}</div><button className="quiet-button" type="button" onClick={() => restoreBackup(backup)} disabled={saving || Boolean(backup.diagnostic)}>Восстановить</button></article>)}</div> : <p className="history-empty">Резервных копий пока нет. Создайте первую копию кнопкой выше.</p>}</section></div>
+        <p className="restore-note">Восстановление заменяет всю базу. Перед заменой создаётся страховочная копия. Это действие не является покомандной отменой.</p>
+      </section></div>}
+      {reportDialogOpen && snapshot && <div className="report-backdrop"><section className="report-shell" role="dialog" aria-modal="true" aria-labelledby="report-title">
+        <div className="report-toolbar"><button className="quiet-button" type="button" onClick={() => setReportDialogOpen(false)}>Назад</button><div><strong>Предпросмотр отчёта</strong><span>Для файла выберите «Microsoft Print to PDF» в системном окне</span></div><button className="primary-button" type="button" onClick={() => window.print()}>Печать / PDF</button></div>
+        <article className="print-report">
+          <header className="report-header"><div><span className="report-kicker">easyPTO · ИНЖЕНЕРНЫЙ КОНТРОЛЬ</span><h1 id="report-title">Слои дорожной одежды</h1><h2>{snapshot.project.name}</h2></div><div className="report-meta"><span>Период: ПК {formatPk(snapshot.project.routeStart)} — {formatPk(snapshot.project.routeEnd)}</span><span>Длина трассы: {formatNumber((snapshot.project.routeEnd - snapshot.project.routeStart) / 1000, 3)} км</span><span>Сформирован: {new Intl.DateTimeFormat("ru-RU", { dateStyle: "long" }).format(new Date())}</span><span>Версия расчёта: {snapshot.calculationVersion}</span></div></header>
+          <section className="report-summary"><div><span>ВЫПОЛНЕНО ПО СЛОЯМ</span><strong>{roundedPercent(snapshot.summary.progressPercent)}%</strong><small>{formatKm(snapshot.summary.coveredLengthCentiPk)} из {formatKm(snapshot.summary.workAreaLengthCentiPk)} · км·слоёв</small></div><div><span>ОСТАЛОСЬ</span><strong>{formatKm(snapshot.summary.remainingLengthCentiPk)}</strong><small>суммарно по применимым слоям</small></div><div><span>НИЖЕ ПЛАНА</span><strong>{snapshot.summary.layersBehindPlan} слоя</strong><small>отклонение в п.п.</small></div></section>
+          {snapshot.bridgeEnabled && bridgeArea && <section className="report-bridge"><strong>Мост</strong><span>{bridgeArea.intervals.map((range) => `ПК ${formatPk(range.fromCentiPk)}–${formatPk(range.toCentiPk)}`).join(", ")}</span><span>{bridgeLayers.length} применимых слоёв · {formatKm(bridgeLength)} на один слой</span></section>}
+          <section className="report-section"><h2>Выполнение по слоям</h2><table className="report-layer-table"><thead><tr><th>Слой</th><th>Факт</th><th>План</th><th>Δ п.п.</th><th>Фронт</th><th>Шкала трассы, ПК {formatPk(snapshot.project.routeStart)}—{formatPk(snapshot.project.routeEnd)}</th></tr></thead><tbody>{snapshot.layers.map((layer) => <tr key={layer.id}><td><span className="report-layer-title"><i style={{ background: layer.color }} />{layer.code} · {layer.name}</span><small>{formatKm(layer.coveredLengthCentiPk)} / {formatKm(layer.workAreaLengthCentiPk)}</small></td><td>{roundedPercent(layer.progressPercent)}%</td><td>{layer.planPercent === null ? "—" : `${formatNumber(layer.planPercent, 1)}%`}<small>{formatDate(layer.planDate)}</small></td><td>{layer.planDeltaPp === null ? "—" : `${layer.planDeltaPp > 0 ? "+" : ""}${formatNumber(layer.planDeltaPp, 1)}`}</td><td>{formatKm(layer.frontLengthCentiPk)}</td><td><div className="report-track">{layer.frontIntervals.map((range, index) => <i className="report-front" key={`f-${index}`} style={{ left: `${((range.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((range.toCentiPk - range.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%` }} />)}{layer.coveredIntervals.map((range, index) => <i className="report-covered" key={`c-${index}`} style={{ left: `${((range.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((range.toCentiPk - range.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, background: layer.color }} />)}</div></td></tr>)}</tbody></table></section>
+          <section className="report-section"><h2>Участки работ</h2><table className="report-segment-table"><thead><tr><th>Слой</th><th>Рабочая область</th><th>От, ПК</th><th>До, ПК</th><th>Длина</th><th>Дата</th><th>Комментарий</th></tr></thead><tbody>{snapshot.layers.flatMap((layer) => layer.segments.map((segment) => { const area = snapshot.workAreas.find((item) => item.id === segment.workAreaId); const inactiveBridge = area?.kind === "bridge" && !snapshot.bridgeEnabled; return <tr key={segment.id} className={inactiveBridge ? "not-counted" : undefined}><td>{layer.code} · {layer.name}</td><td>{area?.name ?? "—"}{inactiveBridge && <small>мост отключён</small>}</td><td className="mono">{formatPk(segment.fromCentiPk)}</td><td className="mono">{formatPk(segment.toCentiPk)}</td><td>{formatKm(segment.toCentiPk - segment.fromCentiPk)}</td><td>{formatDate(segment.workDate)}</td><td>{segment.note || "—"}</td></tr>; }))}{!snapshot.layers.some((layer) => layer.segments.length) && <tr><td colSpan={7}>Отрезков работ пока нет.</td></tr>}</tbody></table></section>
+          <section className="report-section"><h2>Исключённые диапазоны</h2>{snapshot.exclusions.length ? <table className="report-segment-table"><thead><tr><th>Название</th><th>Диапазон, ПК</th><th>Причина</th><th>Слои</th><th>Рабочие области</th></tr></thead><tbody>{snapshot.exclusions.map((item) => <tr key={item.id}><td>{item.name}</td><td className="mono">{item.intervals.map((range) => `${formatPk(range.fromCentiPk)}–${formatPk(range.toCentiPk)}`).join(", ")}</td><td>{item.reason}</td><td>{item.appliesToLayerIds.map((id) => snapshot.layers.find((layer) => layer.id === id)?.name ?? id).join(", ")}</td><td>{item.workAreaIds.map((id) => snapshot.workAreas.find((area) => area.id === id)?.name ?? id).join(", ")}</td></tr>)}</tbody></table> : <p>Исключённых диапазонов нет.</p>}</section>
+          <footer className="report-footer"><span>Сформировано приложением easyPTO</span><span>Расчётная модель {snapshot.calculationVersion}</span></footer>
+        </article>
+      </section></div>}
+    </div>
+  );
+}
+
+function LayerRow({ layer, project, searchPosition, selected, onSelect }: { layer: LayerSnapshot; project: ProjectListItem; searchPosition: number | null; selected: boolean; onSelect: () => void }) {
+  const routeLength = project.routeEnd - project.routeStart;
+  const intervalStyle = (interval: Interval): CSSProperties => ({
+    left: `${((interval.fromCentiPk - project.routeStart) / routeLength) * 100}%`,
+    width: `${((interval.toCentiPk - interval.fromCentiPk) / routeLength) * 100}%`,
+  });
+  return <button className={`layer-grid layer-row${selected ? " selected" : ""}`} type="button" onClick={onSelect} style={{ "--layer-color": layer.color } as CSSProperties} aria-label={`${layer.name}. Факт ${roundedPercent(layer.progressPercent)} процентов. План ${layer.planPercent === null ? "не задан" : `${formatNumber(layer.planPercent, 1)} процентов`}.`} aria-pressed={selected}>
+    <span className="layer-name-cell"><span className="layer-index mono">{String(layer.sortOrder + 1).padStart(2, "0")}</span><span className="layer-swatch" /><strong>{layer.name}</strong></span>
+    <span className="fact-cell"><strong className="mono">{roundedPercent(layer.progressPercent)}<small>%</small></strong><span>{formatKm(layer.coveredLengthCentiPk)}</span></span>
+    <span className="plan-cell">{layer.planPercent === null ? <><strong className="plan-empty">—</strong><span>не задан</span></> : <><strong className="mono">{formatNumber(layer.planPercent, 1)}<small>%</small></strong><span>{formatDate(layer.planDate)}</span></>}</span>
+    <span className={`delta-cell${layer.planDeltaPp === null ? " neutral" : layer.planDeltaPp < 0 ? " negative" : layer.planDeltaPp > 0 ? " positive" : " neutral"}`}><span className="delta-symbol" aria-hidden="true">{layer.planDeltaPp === null || layer.planDeltaPp === 0 ? "—" : layer.planDeltaPp < 0 ? "↓" : "↑"}</span><strong className="mono">{layer.planDeltaPp === null ? "—" : `${layer.planDeltaPp > 0 ? "+" : ""}${formatNumber(layer.planDeltaPp, 1)}`}</strong></span>
+    <span className="front-cell"><strong className="mono">{formatKm(layer.frontLengthCentiPk)}</strong></span>
+    <span className="track-cell"><span className="track-base" aria-hidden="true">{layer.coveredIntervals.map((interval, index) => <i key={`covered-${index}`} className="track-covered" style={intervalStyle(interval)} />)}{layer.frontIntervals.map((interval, index) => <i key={`front-${index}`} className="track-front" style={intervalStyle(interval)} />)}<span className="track-ticks"><i /><i /><i /><i /></span>{searchPosition !== null && <i className="search-marker" style={{ left: `${searchPosition}%` }} />}</span></span>
+  </button>;
+}
+
+function EmptyProjectState({ error, onCreate }: { error: string | null; onCreate: () => void }) {
+  return <section className="empty-project-state"><span className="empty-project-icon"><RoadIcon /></span><span className="field-label">РАБОЧЕЕ МЕСТО</span><h1>{error ? "Локальная база пока недоступна" : "Создайте первый объект"}</h1><p>{error ? error : "Укажите название и границы трассы. easyPTO создаст начальные дорожные слои для дальнейшей настройки."}</p><button className="primary-button" type="button" onClick={onCreate}><PlusIcon /> Создать объект</button></section>;
+}
+
+function LoadingState() { return <div className="loading-state" role="status"><span className="loading-indicator" /><span>Загрузка объекта…</span></div>; }
+
+function RoadIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 2 3.8 18M14 2l2.2 16M10 3v3m0 3v3m0 3v2" /></svg>; }
+function RouteIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v4a4 4 0 0 0 4 4h6a4 4 0 0 1 4 4v4M5 4h4M5 4v4m14 12h-4m4 0v-4" /></svg>; }
+function DatabaseIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><ellipse cx="10" cy="4" rx="6.2" ry="2.3" /><path d="M3.8 4v5.9c0 1.3 2.8 2.4 6.2 2.4s6.2-1.1 6.2-2.4V4M3.8 9.8v5.8c0 1.3 2.8 2.4 6.2 2.4s6.2-1.1 6.2-2.4V9.8" /></svg>; }
+function DocumentIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.8h6l4 4v10.4H5zM11 2.8v4h4M7.5 11h5m-5 3h5" /></svg>; }
+function ExportIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 12V3m0 0L6.5 6.5M10 3l3.5 3.5M4 11v5h12v-5" /></svg>; }
+function SearchIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.7" cy="8.7" r="5.7" /><path d="m13 13 4 4" /></svg>; }
+function EditIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 13.7-.8 3.1 3.1-.8L16 8.3 12.7 5 4 13.7ZM11.5 6.2l3.3 3.3" /></svg>; }
+function TrashIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 6h11M8 6V3.8h4V6m-6.5 0 .7 10.2h7.6L14.5 6M8.5 9v4.5m3-4.5v4.5" /></svg>; }
+function PlusIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>; }
+function InfoIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2" /><path d="M10 9v4m0-6h.01" /></svg>; }
+function CheckIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 10.5 3.7 3.3 7.3-7.6" /></svg>; }
+
+export default App;
