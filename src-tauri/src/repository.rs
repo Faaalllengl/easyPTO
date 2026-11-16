@@ -5,9 +5,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::domain::{
-    BridgeConfigInput, CentiPk, Exclusion, ExclusionInput, Interval, LayerInput, LayerSnapshot,
-    ProjectListItem, ProjectSnapshot, ProjectSummary, Segment, SegmentInput, WorkArea,
-    WorkAreaInput, WorkAreaKind,
+    BridgeConfigInput, CentiPk, ConstructionLine, ConstructionLineInput,
+    ConstructionProgressEntry, ConstructionSnapshot, Exclusion, ExclusionInput, Interval,
+    LayerInput, LayerSnapshot, ProjectListItem, ProjectSnapshot, ProjectSummary, Segment,
+    SegmentInput, WorkArea, WorkAreaInput, WorkAreaKind,
 };
 
 type Result<T> = std::result::Result<T, String>;
@@ -95,10 +96,357 @@ fn db_error(error: rusqlite::Error) -> String {
     format!("Ошибка локальной базы данных: {error}")
 }
 
+fn validate_construction_amount(unit: &str, amount: f64, label: &str) -> Result<()> {
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(format!("{label}: укажите число больше нуля"));
+    }
+    if amount > 1_000_000_000.0 {
+        return Err(format!("{label}: значение превышает допустимый диапазон"));
+    }
+    if unit == "pieces" && amount.fract() != 0.0 {
+        return Err(format!("{label}: количество штук должно быть целым числом"));
+    }
+    if unit == "meters" && (amount * 100.0 - (amount * 100.0).round()).abs() > 1e-7 {
+        return Err(format!("{label}: длину в метрах укажите с точностью до 0,01"));
+    }
+    Ok(())
+}
+
+pub fn load_construction_snapshot(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<ConstructionSnapshot> {
+    let project = connection
+        .query_row(
+            "SELECT id, name, address, route_start_centi_pk, route_end_centi_pk, updated_at
+             FROM projects WHERE id = ?1",
+            [project_id],
+            |row| {
+                Ok(ProjectListItem {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    address: row.get(2)?,
+                    route_start: CentiPk(row.get(3)?),
+                    route_end: CentiPk(row.get(4)?),
+                    updated_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Объект не найден".to_string())?;
+
+    let mut lines = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, name, unit, planned_amount, sort_order
+                 FROM construction_lines WHERE project_id = ?1
+                 ORDER BY sort_order, created_at, id",
+            )
+            .map_err(db_error)?;
+        statement
+            .query_map([project_id], |row| {
+                Ok(ConstructionLine {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    unit: row.get(2)?,
+                    planned_amount: row.get(3)?,
+                    completed_amount: 0.0,
+                    progress_percent: 0.0,
+                    sort_order: row.get(4)?,
+                    entries: Vec::new(),
+                })
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?
+    };
+
+    let mut entries_by_line = HashMap::<String, Vec<ConstructionProgressEntry>>::new();
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT line_id, id, amount, happened_at
+                 FROM construction_progress_entries WHERE project_id = ?1
+                 ORDER BY happened_at DESC, id DESC",
+            )
+            .map_err(db_error)?;
+        let entries = statement
+            .query_map([project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ConstructionProgressEntry {
+                        id: row.get(1)?,
+                        amount: row.get(2)?,
+                        happened_at: row.get(3)?,
+                    },
+                ))
+            })
+            .map_err(db_error)?;
+        for entry in entries {
+            let (line_id, entry) = entry.map_err(db_error)?;
+            entries_by_line.entry(line_id).or_default().push(entry);
+        }
+    }
+
+    let mut progress_sum = 0.0;
+    for line in &mut lines {
+        line.entries = entries_by_line.remove(&line.id).unwrap_or_default();
+        line.completed_amount = line.entries.iter().map(|entry| entry.amount).sum();
+        line.progress_percent = line.completed_amount * 100.0 / line.planned_amount;
+        progress_sum += line.progress_percent;
+    }
+    let progress_percent = if lines.is_empty() {
+        0.0
+    } else {
+        progress_sum / lines.len() as f64
+    };
+
+    Ok(ConstructionSnapshot {
+        project,
+        lines,
+        progress_percent,
+    })
+}
+
+pub fn create_construction_line(
+    connection: &mut Connection,
+    project_id: &str,
+    input: &ConstructionLineInput,
+) -> Result<ConstructionSnapshot> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("Укажите название линии данных".into());
+    }
+    if !matches!(input.unit.as_str(), "pieces" | "meters") {
+        return Err("Выберите единицу измерения: штуки или метры".into());
+    }
+    validate_construction_amount(&input.unit, input.planned_amount, "Проектный объём")?;
+    if input.sort_order < 0 {
+        return Err("Порядок линии не может быть отрицательным".into());
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let exists: bool = transaction
+        .query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)", [project_id], |row| row.get(0))
+        .map_err(db_error)?;
+    if !exists {
+        return Err("Объект не найден".into());
+    }
+    let now = timestamp();
+    transaction
+        .execute(
+            "INSERT INTO construction_lines (id, project_id, name, unit, planned_amount, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![id(), project_id, name, input.unit, input.planned_amount, input.sort_order, now],
+        )
+        .map_err(db_error)?;
+    touch_project(&transaction, project_id, &format!("Добавлена линия строительства «{name}»"))?;
+    let snapshot = load_construction_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn delete_construction_line(
+    connection: &mut Connection,
+    project_id: &str,
+    line_id: &str,
+) -> Result<ConstructionSnapshot> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let name = transaction
+        .query_row(
+            "SELECT name FROM construction_lines WHERE project_id = ?1 AND id = ?2",
+            params![project_id, line_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Линия данных не найдена".to_string())?;
+    transaction
+        .execute("DELETE FROM construction_lines WHERE project_id = ?1 AND id = ?2", params![project_id, line_id])
+        .map_err(db_error)?;
+    touch_project(&transaction, project_id, &format!("Удалена линия строительства «{name}»"))?;
+    let snapshot = load_construction_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn rename_construction_line(
+    connection: &mut Connection,
+    project_id: &str,
+    line_id: &str,
+    new_name: &str,
+) -> Result<ConstructionSnapshot> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("Укажите название линии данных".into());
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let old_name = transaction
+        .query_row(
+            "SELECT name FROM construction_lines WHERE project_id = ?1 AND id = ?2",
+            params![project_id, line_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Линия данных не найдена".to_string())?;
+    transaction
+        .execute(
+            "UPDATE construction_lines SET name = ?1, updated_at = ?2 WHERE project_id = ?3 AND id = ?4",
+            params![new_name, timestamp(), project_id, line_id],
+        )
+        .map_err(db_error)?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!("Линия строительства переименована: «{old_name}» → «{new_name}»"),
+    )?;
+    let snapshot = load_construction_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn update_construction_progress(
+    connection: &mut Connection,
+    project_id: &str,
+    line_id: &str,
+    entry_id: &str,
+    amount: f64,
+) -> Result<ConstructionSnapshot> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let (line_name, unit): (String, String) = transaction
+        .query_row(
+            "SELECT l.name, l.unit FROM construction_lines l
+             JOIN construction_progress_entries e
+               ON e.project_id = l.project_id AND e.line_id = l.id
+             WHERE e.project_id = ?1 AND e.line_id = ?2 AND e.id = ?3",
+            params![project_id, line_id, entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Запись выполнения не найдена".to_string())?;
+    validate_construction_amount(&unit, amount, "Выполненный объём")?;
+    let happened_at = timestamp();
+    transaction
+        .execute(
+            "UPDATE construction_progress_entries SET amount = ?1
+             WHERE project_id = ?2 AND line_id = ?3 AND id = ?4",
+            params![amount, project_id, line_id, entry_id],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "UPDATE construction_lines SET updated_at = ?1 WHERE project_id = ?2 AND id = ?3",
+            params![happened_at, project_id, line_id],
+        )
+        .map_err(db_error)?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!("Исправлена запись выполнения «{line_name}»: {amount} {unit}"),
+    )?;
+    let snapshot = load_construction_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn delete_construction_progress(
+    connection: &mut Connection,
+    project_id: &str,
+    line_id: &str,
+    entry_id: &str,
+) -> Result<ConstructionSnapshot> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let (line_name, amount, unit): (String, f64, String) = transaction
+        .query_row(
+            "SELECT l.name, e.amount, l.unit FROM construction_lines l
+             JOIN construction_progress_entries e
+               ON e.project_id = l.project_id AND e.line_id = l.id
+             WHERE e.project_id = ?1 AND e.line_id = ?2 AND e.id = ?3",
+            params![project_id, line_id, entry_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Запись выполнения не найдена".to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM construction_progress_entries WHERE project_id = ?1 AND line_id = ?2 AND id = ?3",
+            params![project_id, line_id, entry_id],
+        )
+        .map_err(db_error)?;
+    let now = timestamp();
+    transaction
+        .execute(
+            "UPDATE construction_lines SET updated_at = ?1 WHERE project_id = ?2 AND id = ?3",
+            params![now, project_id, line_id],
+        )
+        .map_err(db_error)?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!("Удалена запись выполнения «{line_name}»: {amount} {unit}"),
+    )?;
+    let snapshot = load_construction_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn add_construction_progress(
+    connection: &mut Connection,
+    project_id: &str,
+    line_id: &str,
+    amount: f64,
+) -> Result<ConstructionSnapshot> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let (name, unit): (String, String) = transaction
+        .query_row(
+            "SELECT name, unit FROM construction_lines WHERE project_id = ?1 AND id = ?2",
+            params![project_id, line_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Линия данных не найдена".to_string())?;
+    validate_construction_amount(&unit, amount, "Выполненный объём")?;
+    let happened_at = timestamp();
+    transaction
+        .execute(
+            "INSERT INTO construction_progress_entries (id, project_id, line_id, amount, happened_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id(), project_id, line_id, amount, happened_at],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "UPDATE construction_lines SET updated_at = ?1 WHERE project_id = ?2 AND id = ?3",
+            params![happened_at, project_id, line_id],
+        )
+        .map_err(db_error)?;
+    touch_project(&transaction, project_id, &format!("Добавлена запись выполнения «{name}»: {amount} {unit}"))?;
+    let snapshot = load_construction_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
 pub fn list_projects(connection: &Connection) -> Result<Vec<ProjectListItem>> {
     let mut statement = connection
         .prepare(
-            "SELECT id, name, route_start_centi_pk, route_end_centi_pk, updated_at
+            "SELECT id, name, address, route_start_centi_pk, route_end_centi_pk, updated_at
              FROM projects ORDER BY updated_at DESC, name COLLATE NOCASE",
         )
         .map_err(db_error)?;
@@ -107,14 +455,33 @@ pub fn list_projects(connection: &Connection) -> Result<Vec<ProjectListItem>> {
             Ok(ProjectListItem {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                route_start: CentiPk(row.get(2)?),
-                route_end: CentiPk(row.get(3)?),
-                updated_at: row.get(4)?,
+                address: row.get(2)?,
+                route_start: CentiPk(row.get(3)?),
+                route_end: CentiPk(row.get(4)?),
+                updated_at: row.get(5)?,
             })
         })
         .map_err(db_error)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(db_error)
+}
+
+pub fn set_project_address(
+    connection: &mut Connection,
+    project_id: &str,
+    address: &str,
+) -> Result<Vec<ProjectListItem>> {
+    let address = address.trim();
+    let updated = connection
+        .execute(
+            "UPDATE projects SET address = ?1, updated_at = ?2 WHERE id = ?3",
+            params![address, timestamp(), project_id],
+        )
+        .map_err(db_error)?;
+    if updated == 0 {
+        return Err("Объект не найден".into());
+    }
+    list_projects(connection)
 }
 
 pub fn rename_project(
@@ -307,7 +674,7 @@ pub fn create_project(
 pub fn load_snapshot(connection: &Connection, project_id: &str) -> Result<ProjectSnapshot> {
     let project = connection
         .query_row(
-            "SELECT id, name, route_start_centi_pk, route_end_centi_pk, updated_at,
+            "SELECT id, name, address, route_start_centi_pk, route_end_centi_pk, updated_at,
                     bridge_enabled, bridge_area_id, active_calculation_version
              FROM projects WHERE id = ?1",
             [project_id],
@@ -316,13 +683,14 @@ pub fn load_snapshot(connection: &Connection, project_id: &str) -> Result<Projec
                     ProjectListItem {
                         id: row.get(0)?,
                         name: row.get(1)?,
-                        route_start: CentiPk(row.get(2)?),
-                        route_end: CentiPk(row.get(3)?),
-                        updated_at: row.get(4)?,
+                        address: row.get(2)?,
+                        route_start: CentiPk(row.get(3)?),
+                        route_end: CentiPk(row.get(4)?),
+                        updated_at: row.get(5)?,
                     },
-                    row.get::<_, bool>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )

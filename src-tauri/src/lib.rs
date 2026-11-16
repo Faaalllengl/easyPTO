@@ -13,8 +13,10 @@ mod repository;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_app_metadata.sql")),
     (2, include_str!("../migrations/0002_project_domain.sql")),
+    (3, include_str!("../migrations/0003_construction_progress.sql")),
+    (4, include_str!("../migrations/0004_project_address.sql")),
 ];
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -286,6 +288,19 @@ fn rename_project(
 }
 
 #[tauri::command]
+fn set_project_address(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    address: String,
+) -> Result<Vec<domain::ProjectListItem>, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::set_project_address(&mut connection, &project_id, &address)
+}
+
+#[tauri::command]
 fn delete_project(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -537,6 +552,101 @@ fn delete_custom_work_area(
     repository::delete_custom_work_area(&mut connection, &project_id, &work_area_id)
 }
 
+#[tauri::command]
+fn get_construction_snapshot(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::load_construction_snapshot(&connection, &project_id)
+}
+
+#[tauri::command]
+fn create_construction_line(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    input: domain::ConstructionLineInput,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::create_construction_line(&mut connection, &project_id, &input)
+}
+
+#[tauri::command]
+fn delete_construction_line(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    line_id: String,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::delete_construction_line(&mut connection, &project_id, &line_id)
+}
+
+#[tauri::command]
+fn rename_construction_line(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    line_id: String,
+    name: String,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::rename_construction_line(&mut connection, &project_id, &line_id, &name)
+}
+
+#[tauri::command]
+fn add_construction_progress(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    line_id: String,
+    amount: f64,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::add_construction_progress(&mut connection, &project_id, &line_id, amount)
+}
+
+#[tauri::command]
+fn update_construction_progress(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    line_id: String,
+    entry_id: String,
+    amount: f64,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::update_construction_progress(&mut connection, &project_id, &line_id, &entry_id, amount)
+}
+
+#[tauri::command]
+fn delete_construction_progress(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    line_id: String,
+    entry_id: String,
+) -> Result<domain::ConstructionSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::delete_construction_progress(&mut connection, &project_id, &line_id, &entry_id)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -558,6 +668,7 @@ pub fn run() {
             database_status,
             list_projects,
             rename_project,
+            set_project_address,
             delete_project,
             list_backups,
             create_backup,
@@ -575,7 +686,14 @@ pub fn run() {
             save_exclusion,
             delete_exclusion,
             create_work_area,
-            delete_custom_work_area
+            delete_custom_work_area,
+            get_construction_snapshot,
+            create_construction_line,
+            delete_construction_line,
+            rename_construction_line,
+            add_construction_progress,
+            update_construction_progress,
+            delete_construction_progress
         ])
         .run(tauri::generate_context!())
         .expect("error while running easyPTO");

@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import easyPtoLogo from "./assets/easypto-logo.svg";
 import "./App.css";
 import { exportExcel, exportWord, type ReportSnapshot } from "./report";
 
@@ -11,6 +12,7 @@ type ProjectListItem = {
   name: string;
   routeStart: number;
   routeEnd: number;
+  address: string;
   updatedAt: string;
 };
 type Interval = { fromCentiPk: number; toCentiPk: number };
@@ -65,6 +67,23 @@ type ProjectSnapshot = {
     layersBehindPlan: number;
   };
 };
+type ConstructionProgressEntry = { id: string; amount: number; happenedAt: string };
+type ConstructionLine = {
+  id: string;
+  name: string;
+  unit: "pieces" | "meters";
+  plannedAmount: number;
+  completedAmount: number;
+  progressPercent: number;
+  sortOrder: number;
+  entries: ConstructionProgressEntry[];
+};
+type ConstructionSnapshot = { project: ProjectListItem; lines: ConstructionLine[]; progressPercent: number };
+type ConstructionLineForm = { name: string; unit: "pieces" | "meters"; plannedAmount: string };
+type ActiveModule = "layers" | "construction";
+type ConstructionDeleteTarget =
+  | { kind: "line"; line: ConstructionLine }
+  | { kind: "entry"; line: ConstructionLine; entry: ConstructionProgressEntry };
 const areaProgress = (projectSnapshot: ProjectSnapshot, areaId: string | null, enabled = true) => {
   if (!enabled || !areaId) return { covered: 0, total: 0, percent: 0 };
   const area = projectSnapshot.workAreas.find((item) => item.id === areaId);
@@ -169,6 +188,28 @@ function App() {
   const [projects, setProjects] = useState<ProjectListItem[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [snapshot, setSnapshot] = useState<ProjectSnapshot | null>(null);
+  const [constructionSnapshot, setConstructionSnapshot] = useState<ConstructionSnapshot | null>(null);
+  const [activeModule, setActiveModule] = useState<ActiveModule>("layers");
+  const [constructionLoading, setConstructionLoading] = useState(false);
+  const [constructionLoadAttempt, setConstructionLoadAttempt] = useState(0);
+  const [constructionLineEditorOpen, setConstructionLineEditorOpen] = useState(false);
+  const [constructionLineForm, setConstructionLineForm] = useState<ConstructionLineForm>({ name: "", unit: "meters", plannedAmount: "" });
+  const [activeConstructionLineId, setActiveConstructionLineId] = useState<string | null>(null);
+  const [constructionProgressAmount, setConstructionProgressAmount] = useState("");
+  const [editingConstructionLineId, setEditingConstructionLineId] = useState<string | null>(null);
+  const [constructionLineName, setConstructionLineName] = useState("");
+  const [editingConstructionEntryId, setEditingConstructionEntryId] = useState<string | null>(null);
+  const [constructionEntryAmount, setConstructionEntryAmount] = useState("");
+  const [constructionReportOpen, setConstructionReportOpen] = useState(false);
+  const [constructionReportSetupOpen, setConstructionReportSetupOpen] = useState(false);
+  const [constructionReportPhoto, setConstructionReportPhoto] = useState<string | null>(null);
+  const constructionReportPhotoInput = useRef<HTMLInputElement>(null);
+  const [constructionAddressEditing, setConstructionAddressEditing] = useState(false);
+  const [constructionAddressDraft, setConstructionAddressDraft] = useState("");
+  const [constructionGuideOpen, setConstructionGuideOpen] = useState(false);
+  const [constructionGuideStep, setConstructionGuideStep] = useState(0);
+  const [constructionGuideAutoShown, setConstructionGuideAutoShown] = useState(false);
+  const [constructionDeleteTarget, setConstructionDeleteTarget] = useState<ConstructionDeleteTarget | null>(null);
   const [selectedLayerId, setSelectedLayerId] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -218,7 +259,33 @@ function App() {
       setProjects(updatedProjects);
       const refreshed = await invoke<ProjectSnapshot>("get_project_snapshot", { projectId: selectedProjectId });
       setSnapshot(refreshed);
+      if (activeModule === "construction") {
+        const construction = await invoke<ConstructionSnapshot>("get_construction_snapshot", { projectId: selectedProjectId });
+        setConstructionSnapshot(construction);
+      }
       setNotice("Название объекта изменено.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveConstructionAddress = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updatedProjects = await invoke<ProjectListItem[]>("set_project_address", { projectId: selectedProjectId, address: constructionAddressDraft });
+      setProjects(updatedProjects);
+      const project = updatedProjects.find((item) => item.id === selectedProjectId);
+      if (project) {
+        setConstructionSnapshot((current) => current ? { ...current, project } : current);
+        setSnapshot((current) => current ? { ...current, project } : current);
+      }
+      setConstructionAddressEditing(false);
+      setNotice("Адрес объекта сохранён.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -385,9 +452,196 @@ function App() {
     return () => { alive = false; };
   }, [selectedProjectId]);
 
+  useEffect(() => {
+    if (activeModule !== "construction" || !selectedProjectId) {
+      setConstructionSnapshot(null);
+      setConstructionLoading(false);
+      return;
+    }
+    let alive = true;
+    setConstructionLoading(true);
+    setConstructionSnapshot(null);
+    setEditingConstructionLineId(null);
+    setEditingConstructionEntryId(null);
+    setError(null);
+    invoke<ConstructionSnapshot>("get_construction_snapshot", { projectId: selectedProjectId })
+      .then((result) => {
+        if (!alive) return;
+        setConstructionSnapshot(result);
+        setActiveConstructionLineId((current) => result.lines.some((line) => line.id === current) ? current : null);
+      })
+      .catch((reason: unknown) => {
+        if (alive) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => { if (alive) setConstructionLoading(false); });
+    return () => { alive = false; };
+  }, [activeModule, selectedProjectId, constructionLoadAttempt]);
+
+  useEffect(() => {
+    if (activeModule !== "construction" || !constructionSnapshot || constructionGuideAutoShown) return;
+    setConstructionGuideAutoShown(true);
+    try {
+      if (localStorage.getItem("easypto.construction-guide.seen.v1") === "true") return;
+      localStorage.setItem("easypto.construction-guide.seen.v1", "true");
+    } catch {
+      // Still show the first-use guide when browser storage is unavailable.
+    }
+    setConstructionGuideStep(0);
+    setConstructionGuideOpen(true);
+  }, [activeModule, constructionSnapshot, constructionGuideAutoShown]);
+
+  const openConstructionGuide = () => {
+    setConstructionGuideStep(0);
+    setConstructionGuideOpen(true);
+  };
+
+  const closeConstructionGuide = () => setConstructionGuideOpen(false);
+
   const selectedProject = snapshot?.project ?? projects.find((project) => project.id === selectedProjectId) ?? null;
   const selectedLayer = snapshot?.layers.find((layer) => layer.id === selectedLayerId) ?? null;
   const currentFilterPosition = markerPosition(search, selectedProject);
+
+  const saveConstructionLine = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const plannedAmount = Number(constructionLineForm.plannedAmount.trim().replace(",", "."));
+      const updated = await invoke<ConstructionSnapshot>("create_construction_line", {
+        projectId: selectedProjectId,
+        input: {
+          name: constructionLineForm.name,
+          unit: constructionLineForm.unit,
+          plannedAmount,
+          sortOrder: constructionSnapshot?.lines.length ?? 0,
+        },
+      });
+      const projectState = await invoke<ProjectSnapshot>("get_project_snapshot", { projectId: selectedProjectId });
+      setSnapshot(projectState);
+      setConstructionSnapshot(updated);
+      setConstructionLineForm({ name: "", unit: "meters", plannedAmount: "" });
+      setConstructionLineEditorOpen(false);
+      setNotice("Линия данных добавлена.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const addConstructionProgress = async (line: ConstructionLine) => {
+    if (!selectedProjectId) return;
+    const amount = Number(constructionProgressAmount.trim().replace(",", "."));
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ConstructionSnapshot>("add_construction_progress", {
+        projectId: selectedProjectId,
+        lineId: line.id,
+        amount,
+      });
+      const projectState = await invoke<ProjectSnapshot>("get_project_snapshot", { projectId: selectedProjectId });
+      setSnapshot(projectState);
+      setConstructionSnapshot(updated);
+      setConstructionProgressAmount("");
+      setNotice(`Выполненный объём добавлен: ${line.name}.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeConstructionLine = (line: ConstructionLine) => {
+    setConstructionDeleteTarget({ kind: "line", line });
+    setError(null);
+  };
+
+  const adoptConstructionSnapshot = async (updated: ConstructionSnapshot) => {
+    setConstructionSnapshot(updated);
+    const projectState = await invoke<ProjectSnapshot>("get_project_snapshot", { projectId: selectedProjectId });
+    setSnapshot(projectState);
+  };
+
+  const saveConstructionLineName = async (event: FormEvent, line: ConstructionLine) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ConstructionSnapshot>("rename_construction_line", {
+        projectId: selectedProjectId,
+        lineId: line.id,
+        name: constructionLineName,
+      });
+      await adoptConstructionSnapshot(updated);
+      setEditingConstructionLineId(null);
+      setNotice("Название линии изменено.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveConstructionEntry = async (event: FormEvent, line: ConstructionLine, entry: ConstructionProgressEntry) => {
+    event.preventDefault();
+    if (!selectedProjectId) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const amount = Number(constructionEntryAmount.trim().replace(",", "."));
+      const updated = await invoke<ConstructionSnapshot>("update_construction_progress", {
+        projectId: selectedProjectId,
+        lineId: line.id,
+        entryId: entry.id,
+        amount,
+      });
+      await adoptConstructionSnapshot(updated);
+      setEditingConstructionEntryId(null);
+      setConstructionEntryAmount("");
+      setNotice("Запись выполнения исправлена.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeConstructionEntry = (line: ConstructionLine, entry: ConstructionProgressEntry) => {
+    setConstructionDeleteTarget({ kind: "entry", line, entry });
+    setError(null);
+  };
+
+  const confirmConstructionDelete = async () => {
+    if (!selectedProjectId || !constructionDeleteTarget) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const target = constructionDeleteTarget;
+      const updated = target.kind === "line"
+        ? await invoke<ConstructionSnapshot>("delete_construction_line", { projectId: selectedProjectId, lineId: target.line.id })
+        : await invoke<ConstructionSnapshot>("delete_construction_progress", {
+          projectId: selectedProjectId,
+          lineId: target.line.id,
+          entryId: target.entry.id,
+        });
+      await adoptConstructionSnapshot(updated);
+      if (target.kind === "line") {
+        if (activeConstructionLineId === target.line.id) setActiveConstructionLineId(null);
+        setNotice(`Линия «${target.line.name}» и её записи удалены.`);
+      } else {
+        if (editingConstructionEntryId === target.entry.id) setEditingConstructionEntryId(null);
+        setNotice("Запись выполнения удалена.");
+      }
+      setConstructionDeleteTarget(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const visibleLayers = useMemo(() => {
     const allLayers = snapshot?.layers ?? [];
@@ -776,12 +1030,16 @@ function App() {
     }
   };
 
+  const constructionReportStartDate = useMemo(() => {
+    const dates = constructionSnapshot?.lines.flatMap((line) => line.entries.map((entry) => entry.happenedAt.slice(0, 10))).sort();
+    return dates?.[0] ?? dateToday();
+  }, [constructionSnapshot]);
+
   return (
     <div className="application">
       <header className="topbar">
         <a className="brand" href="#workspace" aria-label="easyPTO — рабочая область">
-          <span className="brand-emblem" aria-hidden="true"><span /><span /><span /></span>
-          <span className="brand-word">easy<span>PTO</span></span>
+          <img className="brand-logo" src={easyPtoLogo} alt="" />
         </a>
         <div className="topbar-divider" />
         <label className="object-context">
@@ -792,6 +1050,7 @@ function App() {
           </select>
         </label>
         <button className="new-project-button" type="button" onClick={() => setProjectDialogOpen(true)} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
+        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать модуль</span><select aria-label="Выбрать модуль" value={activeModule} onChange={(event) => setActiveModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option></select></label>
         <div className="topbar-spacer" />
         <div className={`save-state${saving ? " is-saving" : ""}${error ? " is-error" : ""}`} aria-live="polite">
           <span className="save-dot" />
@@ -802,13 +1061,14 @@ function App() {
           <DatabaseIcon />
           <span>{databaseStatus ? "Локально" : loading ? "Подключение…" : "База недоступна"}</span>
         </div>
-        <button className="report-button" type="button" onClick={openReportPreview} disabled={!snapshot || saving || Boolean(error)} title={error ? "Сначала устраните ошибку сохранения" : "Предпросмотр и печать PDF-отчёта"}><DocumentIcon /><span>Отчёт</span></button>
+        {activeModule === "layers" && <button className="report-button" type="button" onClick={openReportPreview} disabled={!snapshot || saving || Boolean(error)} title={error ? "Сначала устраните ошибку сохранения" : "Предпросмотр и печать PDF-отчёта"}><DocumentIcon /><span>Отчёт</span></button>}
       </header>
 
       <div className="workspace" id="workspace">
         <aside className="sidebar" aria-label="Разделы приложения">
           <div className="sidebar-caption">РАБОЧЕЕ МЕСТО</div>
-          <div className="nav-item active" aria-current="page"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></div>
+          <button className={`nav-item${activeModule === "layers" ? " active" : ""}`} type="button" aria-current={activeModule === "layers" ? "page" : undefined} onClick={() => setActiveModule("layers")} title="Слои дорожной одежды"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></button>
+          <button className={`nav-item construction-nav-item${activeModule === "construction" ? " active" : ""}`} type="button" aria-current={activeModule === "construction" ? "page" : undefined} onClick={() => setActiveModule("construction")} title="Строительство автомобильной дороги"><ConstructionIcon /><span>Строительство автомобильной дороги</span><span className="nav-count">{constructionSnapshot?.lines.length ?? 0}</span></button>
           <div className="sidebar-bottom"><span className="local-indicator" /><span>Работа офлайн</span></div>
         </aside>
 
@@ -816,6 +1076,82 @@ function App() {
           {loading && !snapshot ? <LoadingState /> : !snapshot ? (
             <EmptyProjectState error={error} onCreate={() => setProjectDialogOpen(true)} />
           ) : (
+            activeModule === "construction" ? (
+              constructionLoading ? <LoadingState /> : !constructionSnapshot ? <>
+                {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
+                <div className="construction-load-error"><span>Не удалось загрузить данные строительства.</span><button className="quiet-button" type="button" onClick={() => setConstructionLoadAttempt((attempt) => attempt + 1)}>Повторить</button></div>
+              </> : <>
+                <div className="page-heading construction-page-heading">
+                  <div>
+                    <div className="breadcrumb"><span>{constructionSnapshot.project.name}</span><span className="crumb-separator">/</span><strong>Строительство</strong></div>
+                    <h1>Строительство автомобильной дороги</h1>
+                    <div className="construction-object-name">
+                      <div><span>ОБЪЕКТ</span><strong>{constructionSnapshot.project.name}</strong></div>
+                      <div><span>АДРЕС ОБЪЕКТА</span>{constructionAddressEditing ? <form className="construction-address-form" onSubmit={(event) => void saveConstructionAddress(event)}><input autoFocus maxLength={240} value={constructionAddressDraft} onChange={(event) => setConstructionAddressDraft(event.currentTarget.value)} placeholder="Введите адрес объекта" /><button className="compact-button active-action" type="submit" disabled={saving}>Сохранить</button><button className="compact-button" type="button" onClick={() => setConstructionAddressEditing(false)} disabled={saving}>Отмена</button></form> : <button className="construction-address-value" type="button" onClick={() => { setConstructionAddressDraft(constructionSnapshot.project.address); setConstructionAddressEditing(true); }}><strong>{constructionSnapshot.project.address || "Добавить адрес"}</strong><EditIcon /></button>}</div>
+                    </div>
+                  </div>
+                  <div className="page-heading-actions"><button className="quiet-button construction-guide-button" type="button" onClick={openConstructionGuide}><HelpIcon /> Обучение</button><button className="quiet-button construction-report-button" type="button" onClick={() => setConstructionReportSetupOpen(true)}><DocumentIcon /> Отчёт</button><button className="quiet-button" type="button" onClick={openHistory}>История и копии</button><details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details></div>
+                </div>
+
+                {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
+                {notice && <div className="inline-message success-message" role="status"><CheckIcon />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="Закрыть сообщение">×</button></div>}
+
+                <section className="construction-summary" aria-label="Общий прогресс объекта">
+                  <div className="construction-summary-copy"><h2>Общий прогресс по объекту</h2><p>Среднее значение процентов выполнения всех линий данных</p></div>
+                  <strong className="construction-summary-value">{roundedPercent(constructionSnapshot.progressPercent)}<span>%</span></strong>
+                  <div className="construction-summary-track" role="progressbar" aria-label="Общий прогресс по объекту" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(100, constructionSnapshot.progressPercent)}><span style={{ width: `${Math.min(100, Math.max(0, constructionSnapshot.progressPercent))}%` }} /></div>
+                  <span className="construction-summary-count">{constructionSnapshot.lines.length} линий данных</span>
+                </section>
+
+                <section className="construction-panel" aria-labelledby="construction-lines-title">
+                  <div className="panel-heading"><div><h2 id="construction-lines-title">Линии данных</h2></div>{!constructionLineEditorOpen && <button className="compact-button active-action" type="button" onClick={() => setConstructionLineEditorOpen(true)}><PlusIcon /> Добавить линию</button>}</div>
+                  {constructionLineEditorOpen && <form className="construction-editor" onSubmit={saveConstructionLine}>
+                    <div className="construction-form-grid">
+                      <label>Название линии<input autoFocus required maxLength={160} value={constructionLineForm.name} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, name: event.currentTarget.value })} placeholder="Например, установка дорожных знаков" /></label>
+                      <label>Единица измерения<select value={constructionLineForm.unit} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, unit: event.currentTarget.value as ConstructionLineForm["unit"] })}><option value="meters">Метры</option><option value="pieces">Штуки</option></select></label>
+                      <label>{constructionLineForm.unit === "meters" ? "Проектная протяжённость, м" : "Проектное количество, шт"}<input required type="number" min={constructionLineForm.unit === "meters" ? "0.01" : "1"} step={constructionLineForm.unit === "meters" ? "0.01" : "1"} inputMode="decimal" value={constructionLineForm.plannedAmount} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, plannedAmount: event.currentTarget.value })} /></label>
+                    </div>
+                    <div className="form-footer"><span className="form-hint">Фактические объёмы добавляются в эту линию по мере выполнения работ.</span><div><button className="quiet-button" type="button" onClick={() => setConstructionLineEditorOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Создать линию"}</button></div></div>
+                  </form>}
+                  {constructionSnapshot.lines.length ? <div className="construction-list">{constructionSnapshot.lines.map((line, index) => {
+                    const expanded = activeConstructionLineId === line.id;
+                    const unitShort = line.unit === "meters" ? "м" : "шт";
+                    return <article className={`construction-line${expanded ? " expanded" : ""}`} key={line.id}>
+                      <div className="construction-line-row">
+                        <button className="construction-line-main" type="button" onClick={() => { setActiveConstructionLineId(expanded ? null : line.id); setConstructionProgressAmount(""); setEditingConstructionLineId(null); setEditingConstructionEntryId(null); }} aria-expanded={expanded}>
+                          <span className="construction-line-index mono">{String(index + 1).padStart(2, "0")}</span>
+                          <span className="construction-line-content"><strong>{line.name}</strong><span>Выполнено {formatNumber(line.completedAmount, line.unit === "meters" ? 2 : 0)} из {formatNumber(line.plannedAmount, line.unit === "meters" ? 2 : 0)} {unitShort}</span><span className="construction-line-track" aria-hidden="true"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></span></span>
+                          <strong className="construction-line-percent">{roundedPercent(line.progressPercent)}%</strong>
+                          <span className="construction-line-chevron" aria-hidden="true"><ChevronIcon expanded={expanded} /></span>
+                        </button>
+                        <button className="construction-edit-button" type="button" onClick={() => { setActiveConstructionLineId(line.id); setEditingConstructionLineId(line.id); setConstructionLineName(line.name); }} aria-label={`Изменить название линии ${line.name}`} disabled={saving}><EditIcon /></button>
+                        <button className="construction-delete-button" type="button" onClick={(event) => { event.stopPropagation(); removeConstructionLine(line); }} aria-label={`Удалить линию ${line.name}`} disabled={saving}><TrashIcon /></button>
+                      </div>
+                      {expanded && <div className="construction-line-details">
+                        {editingConstructionLineId === line.id && <form className="construction-rename-form" onSubmit={(event) => void saveConstructionLineName(event, line)}>
+                          <label>Название линии<input required maxLength={160} value={constructionLineName} onChange={(event) => setConstructionLineName(event.currentTarget.value)} /></label>
+                          <div><button className="quiet-button" type="button" onClick={() => setEditingConstructionLineId(null)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Сохранить название"}</button></div>
+                        </form>}
+                        <form className="construction-progress-form" onSubmit={(event) => { event.preventDefault(); void addConstructionProgress(line); }}>
+                          <label>Добавить выполненный объём, {unitShort}<input required type="number" min={line.unit === "meters" ? "0.01" : "1"} step={line.unit === "meters" ? "0.01" : "1"} inputMode="decimal" value={constructionProgressAmount} onChange={(event) => setConstructionProgressAmount(event.currentTarget.value)} /></label>
+                          <button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Добавить объём"}</button>
+                        </form>
+                        <div className="construction-history"><strong>Записи выполнения · {line.entries.length}</strong>{line.entries.length ? <ol>{line.entries.map((entry) => <li key={entry.id}>
+                          {editingConstructionEntryId === entry.id ? <form className="construction-entry-edit" onSubmit={(event) => void saveConstructionEntry(event, line, entry)}>
+                            <label><span className="visually-hidden">Исправить объём, {unitShort}</span><input required type="number" min={line.unit === "meters" ? "0.01" : "1"} step={line.unit === "meters" ? "0.01" : "1"} inputMode="decimal" value={constructionEntryAmount} onChange={(event) => setConstructionEntryAmount(event.currentTarget.value)} /></label>
+                            <button type="submit" disabled={saving} aria-label="Сохранить объём"><CheckIcon /></button><button type="button" onClick={() => setEditingConstructionEntryId(null)} aria-label="Отменить изменение"><CloseIcon /></button>
+                          </form> : <>
+                            <div className="construction-entry-data"><time>{formatTimestamp(entry.happenedAt)}</time><span>+{formatNumber(entry.amount, line.unit === "meters" ? 2 : 0)} {unitShort}</span></div>
+                            <div className="construction-entry-actions"><button type="button" onClick={() => { setEditingConstructionEntryId(entry.id); setConstructionEntryAmount(String(entry.amount)); }} aria-label="Изменить запись"><EditIcon /></button><button type="button" onClick={(event) => { event.stopPropagation(); removeConstructionEntry(line, entry); }} aria-label="Удалить запись" disabled={saving}><TrashIcon /></button></div>
+                          </>}
+                        </li>)}</ol> : <p>Записей пока нет. Добавьте первый выполненный объём.</p>}</div>
+                      </div>}
+                    </article>;
+                  })}</div> : !constructionLineEditorOpen && <div className="construction-empty"><span className="empty-icon"><ConstructionIcon /></span><strong>Линий данных пока нет</strong><span>Создайте линию и укажите проектное количество или протяжённость.</span><button className="quiet-button" type="button" onClick={() => setConstructionLineEditorOpen(true)}><PlusIcon /> Добавить первую линию</button></div>}
+                </section>
+                <div className="workspace-footnote"><span>easyPTO <b>·</b> строительство автомобильной дороги</span><span>{databaseStatus ? `Схема базы данных ${databaseStatus.schemaVersion}` : "Локальное хранилище"}</span></div>
+              </>
+            ) : (
             <>
               <div className="page-heading">
                 <div>
@@ -963,6 +1299,7 @@ function App() {
 
               <div className="workspace-footnote"><span>easyPTO <b>·</b> слои дорожной одежды</span><span>{databaseStatus ? `Схема базы данных ${databaseStatus.schemaVersion}` : "Локальное хранилище"}</span></div>
             </>
+            )
           )}
         </main>
       </div>
@@ -981,12 +1318,47 @@ function App() {
         <div className="dialog-route"><label>Начало трассы, ПК<input required inputMode="decimal" value={routeStartPk} onChange={(event) => setRouteStartPk(event.currentTarget.value)} /></label><span aria-hidden="true">→</span><label>Конец трассы, ПК<input required inputMode="decimal" value={routeEndPk} onChange={(event) => setRouteEndPk(event.currentTarget.value)} /></label></div>
         <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => setProjectDialogOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Создание…" : "Создать объект"}</button></div>
       </form></div>}
+      {constructionGuideOpen && <div className="modal-backdrop construction-guide-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeConstructionGuide(); }}><section className="project-dialog construction-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="construction-guide-title" aria-describedby="construction-guide-copy">
+        <div className="construction-guide-topline"><span className="field-label">КРАТКОЕ ОБУЧЕНИЕ</span><span>Шаг {constructionGuideStep + 1} из 3</span></div>
+        <div className="construction-guide-progress" aria-hidden="true"><i style={{ width: `${((constructionGuideStep + 1) / 3) * 100}%` }} /></div>
+        <h2 id="construction-guide-title">{["Добавьте линии работ", "Заносите выполненный объём", "Следите за прогрессом и отчётом"][constructionGuideStep]}</h2>
+        <p id="construction-guide-copy">{[
+          "Создайте отдельную линию для каждого вида работ. Укажите название, единицу измерения и плановый объём — например, «Укладка асфальта», метры, 1 200.",
+          "Откройте линию и добавляйте фактически выполненный объём. Приложение суммирует записи, пересчитывает проценты и сохраняет дату каждой записи.",
+          "Общий и построчный прогресс обновляются автоматически. Укажите адрес рядом с названием объекта, затем откройте «Отчёт»: его можно распечатать в PDF, с фотографией или без неё."
+        ][constructionGuideStep]}</p>
+        <div className="construction-guide-footer"><button className="quiet-button" type="button" onClick={closeConstructionGuide}>Закрыть обучение</button><div>{constructionGuideStep > 0 && <button className="quiet-button" type="button" onClick={() => setConstructionGuideStep((step) => step - 1)}>Назад</button>}<button className="primary-button" type="button" onClick={() => constructionGuideStep < 2 ? setConstructionGuideStep((step) => step + 1) : closeConstructionGuide()}>{constructionGuideStep < 2 ? "Дальше" : "Начать работу"}</button></div></div>
+      </section></div>}
       {historyDialogOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setHistoryDialogOpen(false); }}><section className="history-dialog" role="dialog" aria-modal="true" aria-labelledby="history-dialog-title">
         <div className="dialog-heading"><div><span className="field-label">СОХРАННОСТЬ ДАННЫХ</span><h2 id="history-dialog-title">История и резервные копии</h2><p>Изменения записываются в локальную базу после проверки каждой операции.</p></div><button className="close-editor" type="button" onClick={() => setHistoryDialogOpen(false)} aria-label="Закрыть историю">×</button></div>
         {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
         <div className="backup-actions"><div><strong>Резервная копия всей базы</strong><span>Содержит все объекты на этом компьютере.</span></div><button className="primary-button" type="button" onClick={createManualBackup} disabled={saving}>{saving ? "Создание…" : "Создать копию"}</button></div>
         <div className="history-columns"><section><h3>Последние действия · {snapshot?.project.name}</h3>{snapshot?.journal.length ? <ol className="journal-list">{snapshot.journal.map((item) => <li key={item.id}><span className="journal-dot" /><div><strong>{item.summary}</strong><time>{formatTimestamp(item.happenedAt)}</time></div></li>)}</ol> : <p className="history-empty">Пока нет записей журнала.</p>}</section><section><h3>Резервные копии · {backups.length}</h3>{backups.length ? <div className="backup-list">{backups.map((backup) => <article className="backup-row" key={backup.fileName}><div><strong>{formatTimestamp(backup.createdAt)}</strong><span>{backup.source}</span><small>{backup.projectNames.join(", ") || "Нет объектов"}</small>{backup.diagnostic && <small className="backup-diagnostic">Копию нельзя восстановить: {backup.diagnostic}</small>}</div><button className="quiet-button" type="button" onClick={() => restoreBackup(backup)} disabled={saving || Boolean(backup.diagnostic)}>Восстановить</button></article>)}</div> : <p className="history-empty">Резервных копий пока нет. Создайте первую копию кнопкой выше.</p>}</section></div>
         <p className="restore-note">Восстановление заменяет всю базу. Перед заменой создаётся страховочная копия. Это действие не является покомандной отменой.</p>
+      </section></div>}
+      {constructionReportSetupOpen && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setConstructionReportSetupOpen(false); }}><section className="project-dialog construction-photo-dialog" role="dialog" aria-modal="true" aria-labelledby="construction-photo-title">
+        <div className="dialog-heading"><div><span className="field-label">ОФОРМЛЕНИЕ ОТЧЁТА</span><h2 id="construction-photo-title">Прикрепить фото?</h2><p>Можно добавить фотографию объекта в отчёт или продолжить без неё.</p></div><button className="close-editor" type="button" onClick={() => setConstructionReportSetupOpen(false)} aria-label="Закрыть">×</button></div>
+        <input ref={constructionReportPhotoInput} className="visually-hidden" type="file" accept="image/*" aria-label="Выбрать фотографию объекта" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { if (typeof reader.result === "string") { setConstructionReportPhoto(reader.result); setConstructionReportSetupOpen(false); setConstructionReportOpen(true); } }; reader.readAsDataURL(file); event.currentTarget.value = ""; }} />
+        <div className="construction-photo-actions"><button className="quiet-button" type="button" onClick={() => { setConstructionReportPhoto(null); setConstructionReportSetupOpen(false); setConstructionReportOpen(true); }}>Продолжить без фото</button><button className="primary-button" type="button" onClick={() => constructionReportPhotoInput.current?.click()}>Выбрать фото на компьютере</button></div>
+      </section></div>}
+      {constructionReportOpen && constructionSnapshot && <div className="report-backdrop"><section className="report-shell construction-report-shell" role="dialog" aria-modal="true" aria-labelledby="construction-report-title">
+        <div className="report-toolbar"><button className="quiet-button" type="button" onClick={() => setConstructionReportOpen(false)}>Назад</button><div><strong>Отчёт о выполнении работ</strong><span>Для сохранения выберите «Microsoft Print to PDF»</span></div><button className="primary-button" type="button" onClick={() => window.print()}>Печать / PDF</button></div>
+        <article className={`print-report construction-print-report${constructionReportPhoto ? " has-report-photo" : ""}`}>
+          <header className="construction-report-header"><img className="construction-brand-logo" src={easyPtoLogo} alt="easyPTO" /><div className="construction-report-meta"><span>Дата формирования: {new Intl.DateTimeFormat("ru-RU").format(new Date())}</span></div></header>
+          <h1 id="construction-report-title">Отчёт о выполнении работ</h1><p className="construction-report-subtitle">Проект строительства автомобильной дороги</p>
+          <section className={`construction-report-overview${constructionReportPhoto ? " with-photo" : ""}`}><div className="construction-report-object"><div><span>Объект:</span><strong>{constructionSnapshot.project.name}</strong></div><div><span>Адрес:</span><strong>{constructionSnapshot.project.address || "—"}</strong></div><div><span>Период отчёта:</span><strong>с {new Intl.DateTimeFormat("ru-RU").format(new Date(`${constructionReportStartDate}T00:00:00`))} по {new Intl.DateTimeFormat("ru-RU").format(new Date())}</strong></div></div>{constructionReportPhoto && <img className="construction-report-photo" src={constructionReportPhoto} alt="Фото объекта строительства" />}</section>
+          <section className="construction-report-progress"><h2>Общий прогресс по объекту</h2><div className="construction-report-progress-body"><strong>{roundedPercent(constructionSnapshot.progressPercent)}<small>%</small></strong><div className="construction-report-progress-track"><i style={{ width: `${Math.min(100, Math.max(0, constructionSnapshot.progressPercent))}%` }} /></div><span>{constructionSnapshot.lines.length} линии данных</span></div></section>
+          <div className="construction-report-charts"><section className="construction-report-card"><h2>Выполнение по линиям данных</h2><div className="construction-donut-layout"><div className="construction-donut"><svg viewBox="0 0 120 120" role="img" aria-label={`Выполнено ${roundedPercent(constructionSnapshot.progressPercent)} процентов`}><circle className="construction-donut-remaining" cx="60" cy="60" r="45" /><circle className="construction-donut-completed" cx="60" cy="60" r="45" strokeDasharray={`${(2 * Math.PI * 45 * Math.min(100, Math.max(0, constructionSnapshot.progressPercent))) / 100} ${2 * Math.PI * 45}`} /></svg><div><strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong><span>общий<br />прогресс</span></div></div><div className="construction-donut-legend"><span><i />Выполнено <strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong></span><span><i />Осталось <strong>{roundedPercent(Math.max(0, 100 - constructionSnapshot.progressPercent))}%</strong></span></div></div></section></div>
+          <section className="construction-report-card construction-report-lines"><h2>Линии данных (объёмы работ)</h2><table className="report-layer-table construction-report-table"><thead><tr><th>№</th><th>Наименование</th><th>Ед. изм.</th><th>Объём (план)</th><th>Выполнено</th><th>Прогресс</th></tr></thead><tbody>{constructionSnapshot.lines.map((line, index) => { const unitShort = line.unit === "meters" ? "м" : "шт"; return <tr key={line.id}><td>{String(index + 1).padStart(2, "0")}</td><td>{line.name}</td><td>{unitShort}</td><td>{formatNumber(line.plannedAmount, line.unit === "meters" ? 2 : 0)}</td><td>{formatNumber(line.completedAmount, line.unit === "meters" ? 2 : 0)}</td><td><strong>{roundedPercent(line.progressPercent)}%</strong><div className="report-track construction-report-track"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></div></td></tr>; })}{!constructionSnapshot.lines.length && <tr><td colSpan={6}>Линий данных пока нет.</td></tr>}<tr className="construction-report-total"><td colSpan={2}>Итого по объекту</td><td>—</td><td>—</td><td>—</td><td><strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong><div className="report-track construction-report-track"><i style={{ width: `${Math.min(100, Math.max(0, constructionSnapshot.progressPercent))}%` }} /></div></td></tr></tbody></table></section>
+          <footer className="construction-report-footer"><strong>easyPTO</strong><span>Страница 1 из 1</span></footer>
+        </article>
+      </section></div>}
+      {constructionDeleteTarget && <div className="modal-backdrop construction-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setConstructionDeleteTarget(null); }}><section className="project-dialog construction-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="construction-delete-title" aria-describedby="construction-delete-description">
+        <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ДАННЫХ</span><h2 id="construction-delete-title">Подтвердите удаление</h2><p id="construction-delete-description">{constructionDeleteTarget.kind === "line"
+          ? `Удалить линию «${constructionDeleteTarget.line.name}» и все её записи выполнения? Общий прогресс объекта будет пересчитан.`
+          : `Удалить запись ${formatNumber(constructionDeleteTarget.entry.amount, constructionDeleteTarget.line.unit === "meters" ? 2 : 0)} ${constructionDeleteTarget.line.unit === "meters" ? "м" : "шт"} из линии «${constructionDeleteTarget.line.name}»? Прогресс будет пересчитан.`}</p></div><button className="close-editor" type="button" onClick={() => setConstructionDeleteTarget(null)} disabled={saving} aria-label="Отмена">×</button></div>
+        {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
+        <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => { setConstructionDeleteTarget(null); setError(null); }} disabled={saving}>Отмена</button><button className="danger-button" type="button" onClick={() => void confirmConstructionDelete()} disabled={saving}>{saving ? "Удаление…" : "Удалить"}</button></div>
       </section></div>}
       {reportDialogOpen && snapshot && <div className="report-backdrop"><section className="report-shell" role="dialog" aria-modal="true" aria-labelledby="report-title">
         <div className="report-toolbar"><button className="quiet-button" type="button" onClick={() => setReportDialogOpen(false)}>Назад</button><div><strong>Предпросмотр отчёта</strong><span>Для файла выберите «Microsoft Print to PDF» в системном окне</span></div><button className="primary-button" type="button" onClick={() => window.print()}>Печать / PDF</button></div>
@@ -1027,9 +1399,13 @@ function EmptyProjectState({ error, onCreate }: { error: string | null; onCreate
 function LoadingState() { return <div className="loading-state" role="status"><span className="loading-indicator" /><span>Загрузка объекта…</span></div>; }
 
 function RoadIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 2 3.8 18M14 2l2.2 16M10 3v3m0 3v3m0 3v2" /></svg>; }
+function ConstructionIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 17V8l4.8-4 4.6 4v9M12.4 11.5h4.8V17M6.4 10.5h2.2m-2.2 3h2.2m6.2 0h.1M2 17h16" /></svg>; }
+function ChevronIcon({ expanded }: { expanded: boolean }) { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d={expanded ? "m5 12 5-5 5 5" : "m5 8 5 5 5-5"} /></svg>; }
+function CloseIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>; }
 function RouteIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v4a4 4 0 0 0 4 4h6a4 4 0 0 1 4 4v4M5 4h4M5 4v4m14 12h-4m4 0v-4" /></svg>; }
 function DatabaseIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><ellipse cx="10" cy="4" rx="6.2" ry="2.3" /><path d="M3.8 4v5.9c0 1.3 2.8 2.4 6.2 2.4s6.2-1.1 6.2-2.4V4M3.8 9.8v5.8c0 1.3 2.8 2.4 6.2 2.4s6.2-1.1 6.2-2.4V9.8" /></svg>; }
 function DocumentIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 2.8h6l4 4v10.4H5zM11 2.8v4h4M7.5 11h5m-5 3h5" /></svg>; }
+function HelpIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2" /><path d="M7.8 7.8a2.3 2.3 0 1 1 3.8 1.7c-1.1.9-1.6 1.2-1.6 2.5m0 2.6h.01" /></svg>; }
 function ExportIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 12V3m0 0L6.5 6.5M10 3l3.5 3.5M4 11v5h12v-5" /></svg>; }
 function SearchIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.7" cy="8.7" r="5.7" /><path d="m13 13 4 4" /></svg>; }
 function EditIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 13.7-.8 3.1 3.1-.8L16 8.3 12.7 5 4 13.7ZM11.5 6.2l3.3 3.3" /></svg>; }

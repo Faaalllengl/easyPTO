@@ -185,6 +185,7 @@ pub struct JournalEvent {
 pub struct ProjectListItem {
     pub id: String,
     pub name: String,
+    pub address: String,
     pub route_start: CentiPk,
     pub route_end: CentiPk,
     pub updated_at: String,
@@ -296,4 +297,42 @@ pub struct WorkAreaInput {
     pub from_pk: String,
     pub to_pk: String,
     pub layer_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConstructionProgressEntry {
+    pub id: String,
+    pub amount: f64,
+    pub happened_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConstructionLine {
+    pub id: String,
+    pub name: String,
+    pub unit: String,
+    pub planned_amount: f64,
+    pub completed_amount: f64,
+    pub progress_percent: f64,
+    pub sort_order: i64,
+    pub entries: Vec<ConstructionProgressEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConstructionSnapshot {
+    pub project: ProjectListItem,
+    pub lines: Vec<ConstructionLine>,
+    pub progress_percent: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConstructionLineInput {
+    pub name: String,
+    pub unit: String,
+    pub planned_amount: f64,
+    pub sort_order: i64,
 }

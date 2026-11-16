@@ -62,34 +62,10 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 10px;
   color: var(--ink);
   text-decoration: none;
 }
-
-.brand-emblem {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  align-content: center;
-  justify-items: center;
-  gap: 3px;
-  border-radius: 7px;
-  background: var(--accent);
-}
-
-.brand-emblem span {
-  display: block;
-  width: 16px;
-  height: 2px;
-  border-radius: 2px;
-  background: #fff;
-}
-
-.brand-emblem span:nth-child(2) { width: 11px; }
-.brand-emblem span:nth-child(3) { width: 6px; }
-.brand-word { font-size: 18px; font-weight: 650; letter-spacing: -.04em; }
-.brand-word span { color: var(--accent); }
+.brand-logo { display: block; width: 145px; max-height: 42px; }
 
 .topbar-divider { width: 1px; height: 29px; background: var(--line); }
 .object-context { display: flex; min-width: 0; align-items: center; gap: 11px; }
@@ -101,6 +77,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .context-label { color: var(--muted); }
 .object-select { max-width: 270px; overflow: hidden; border: 0; color: var(--ink); background: transparent; font-size: 13px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .object-select:focus-visible { border-radius: 3px; }
+.mobile-module-switch { display: none; }
 .new-project-button { display: inline-flex; height: 30px; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted-dark); background: #fff; cursor: pointer; font-size: 10px; white-space: nowrap; }
 .new-project-button:hover { border-color: #a7c7c1; color: var(--accent-dark); background: #f5faf9; }
 .new-project-button span:first-child { font-size: 17px; line-height: 1; }
@@ -161,10 +138,17 @@ button:disabled { cursor: not-allowed; opacity: .56; }
   color: var(--ink-soft);
   font-size: 13px;
   font-weight: 550;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
 }
 .nav-item svg { width: 18px; height: 18px; }
 .nav-item.active { color: var(--accent-dark); background: #e7f0ef; }
 .nav-count { margin-left: auto; color: var(--muted); font-family: var(--data); font-size: 11px; }
+.construction-nav-item { align-items: flex-start; padding-top: 10px; padding-bottom: 10px; font-size: 11px; line-height: 1.25; }
+.construction-nav-item svg { flex: 0 0 auto; }
+.construction-nav-item .nav-count { padding-top: 1px; }
 .sidebar-bottom { display: flex; align-items: center; gap: 9px; margin: auto 8px 4px; color: var(--muted-dark); font-size: 11px; }
 .local-indicator { width: 7px; height: 7px; border-radius: 50%; background: #3d9079; }
 
@@ -442,6 +426,105 @@ h1 { margin-bottom: 0; font-size: 23px; font-weight: 600; letter-spacing: -.035e
 .success-message { border-color: #c8ddd5; color: #28664e; background: #f2faf6; }
 
 .layer-detail { margin-top: 15px; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); }
+
+.construction-page-heading { align-items: flex-start; }
+.construction-page-heading h1 { margin-bottom: 8px; }
+.construction-object-name { display: flex; align-items: baseline; gap: 9px; color: var(--muted-dark); font-size: 11px; }
+.construction-object-name span { color: var(--muted); font-size: 9px; font-weight: 650; letter-spacing: .075em; }
+.construction-object-name strong { color: var(--ink); font-size: 13px; font-weight: 600; }
+.construction-object-name > div { display: flex; align-items: baseline; gap: 7px; }
+.construction-address-value { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: transparent; color: var(--ink); cursor: pointer; text-align: left; }
+.construction-address-value svg { width: 13px; height: 13px; color: var(--muted); }
+.construction-address-value strong { font-size: 13px; }
+.construction-address-form { display: flex; align-items: center; gap: 5px; }
+.construction-address-form input { width: min(250px, 28vw); min-height: 29px; padding: 4px 7px; border: 1px solid var(--line-strong); border-radius: 4px; background: #fff; color: var(--ink); font: inherit; }
+.construction-address-form .compact-button { width: auto; min-height: 27px; padding: 0 7px; font-size: 9px; }
+.construction-guide-button svg { width: 15px; height: 15px; }
+.construction-guide-dialog { width: min(520px, 100%); padding: 25px; }
+.construction-guide-topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10px; }
+.construction-guide-progress { height: 3px; margin: 11px 0 21px; overflow: hidden; border-radius: 3px; background: #e7eceb; }
+.construction-guide-progress i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .2s ease-out; }
+.construction-guide-dialog h2 { margin: 0 0 8px; color: var(--ink); font-size: 20px; line-height: 1.25; }
+.construction-guide-dialog > p { min-height: 74px; margin: 0; color: var(--muted-dark); font-size: 12px; line-height: 1.65; }
+.construction-guide-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--line); }
+.construction-guide-footer > div { display: flex; gap: 8px; }
+.construction-guide-footer .quiet-button { width: auto; cursor: pointer; }
+.construction-guide-footer .primary-button { flex: 0 0 auto; }
+.construction-summary {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto minmax(140px, 1.3fr) auto;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 14px;
+  padding: 17px 19px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--paper);
+}
+.construction-summary-copy h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+.construction-summary-copy p { margin: 0; color: var(--muted); font-size: 11px; }
+.construction-summary-value { color: var(--accent-dark); font-family: var(--data); font-size: 25px; font-weight: 500; white-space: nowrap; }
+.construction-summary-value span { margin-left: 2px; font-family: var(--sans); font-size: 12px; }
+.construction-summary-track, .construction-line-track { display: block; overflow: hidden; height: 8px; border: 1px solid var(--line-strong); border-radius: 2px; background: #f1f4f5; }
+.construction-summary-track span, .construction-line-track i { display: block; height: 100%; background: var(--accent); transition: width .22s ease-out; }
+.construction-summary-count { color: var(--muted-dark); font-size: 11px; white-space: nowrap; }
+.construction-panel { overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); }
+.construction-editor { padding: 16px 18px; border-bottom: 1px solid var(--line); background: #f8faf9; }
+.construction-form-grid { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(130px, .65fr) minmax(190px, .9fr); gap: 13px; }
+.construction-form-grid label, .construction-progress-form label { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: var(--muted-dark); font-size: 11px; }
+.construction-form-grid input, .construction-form-grid select, .construction-progress-form input { width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: #fff; font-size: 12px; }
+.construction-list { padding: 0 18px; }
+.construction-line { border-bottom: 1px solid var(--line); }
+.construction-line:last-child { border-bottom: 0; }
+.construction-line-row { display: flex; align-items: center; gap: 7px; }
+.construction-line-main { display: grid; flex: 1; min-width: 0; grid-template-columns: 34px minmax(120px, 1fr) minmax(55px, auto) 22px; align-items: center; gap: 12px; padding: 13px 0; border: 0; color: inherit; background: transparent; cursor: pointer; text-align: left; }
+.construction-line-main:hover .construction-line-content > strong { color: var(--accent-dark); }
+.construction-line-index { color: var(--muted); font-size: 11px; }
+.construction-line-content { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.construction-line-content > strong { overflow: hidden; color: var(--ink); font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.construction-line-content > span:nth-child(2) { color: var(--muted-dark); font-size: 11px; }
+.construction-line-track { width: min(100%, 420px); height: 5px; border: 0; background: var(--canvas-deep); }
+.construction-line-percent { color: var(--accent-dark); font-family: var(--data); font-size: 14px; font-weight: 500; text-align: right; white-space: nowrap; }
+.construction-line-chevron { display: grid; width: 22px; height: 22px; place-items: center; color: var(--muted); }
+.construction-line-chevron svg { width: 17px; height: 17px; }
+.construction-delete-button { display: grid; width: 31px; height: 31px; flex: 0 0 auto; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; }
+.construction-delete-button:hover { border-color: #efd7d4; color: var(--danger); background: #fcf5f4; }
+.construction-delete-button svg { width: 16px; height: 16px; }
+.construction-edit-button { display: grid; width: 31px; height: 31px; flex: 0 0 auto; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; }
+.construction-edit-button:hover { border-color: #c9dfda; color: var(--accent-dark); background: #f2f8f6; }
+.construction-edit-button svg { width: 16px; height: 16px; }
+.construction-line-details { display: grid; grid-template-columns: minmax(250px, .8fr) minmax(260px, 1.2fr); gap: 24px; padding: 0 0 16px 46px; }
+.construction-rename-form { display: flex; grid-column: 1 / -1; align-items: end; gap: 10px; }
+.construction-rename-form label { display: flex; max-width: 420px; flex: 1; flex-direction: column; gap: 6px; color: var(--muted-dark); font-size: 11px; }
+.construction-rename-form input, .construction-entry-edit input { height: 31px; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--ink); background: #fff; font-size: 11px; }
+.construction-rename-form > div { display: flex; gap: 6px; }
+.construction-rename-form .quiet-button, .construction-rename-form .primary-button { width: auto; min-height: 31px; padding: 0 9px; font-size: 10px; }
+.construction-progress-form { display: flex; align-items: end; gap: 9px; }
+.construction-progress-form label { flex: 1; }
+.construction-progress-form .primary-button { flex: 0 0 auto; }
+.construction-history > strong { display: block; margin-bottom: 7px; color: var(--ink-soft); font-size: 11px; font-weight: 600; }
+.construction-history ol { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.construction-history li { display: flex; justify-content: space-between; gap: 12px; color: var(--muted-dark); font-size: 10px; }
+.construction-history li span { color: var(--ink); font-family: var(--data); white-space: nowrap; }
+.construction-entry-data { display: flex; min-width: 0; flex: 1; justify-content: space-between; gap: 12px; }
+.construction-entry-actions { display: flex; flex: 0 0 auto; gap: 3px; }
+.construction-entry-actions button, .construction-entry-edit button { display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid transparent; border-radius: 3px; color: var(--muted); background: transparent; cursor: pointer; }
+.construction-entry-actions button:hover { border-color: var(--line); color: var(--accent-dark); background: #f7faf9; }
+.construction-entry-actions button:last-child:hover { border-color: #efd7d4; color: var(--danger); background: #fcf5f4; }
+.construction-entry-actions svg, .construction-entry-edit svg { width: 13px; height: 13px; }
+.construction-entry-edit { display: flex; width: 100%; justify-content: flex-end; gap: 4px; }
+.construction-entry-edit label { min-width: 84px; flex: 0 1 120px; }
+.construction-entry-edit input { width: 100%; height: 24px; font-family: var(--data); font-size: 10px; }
+.construction-entry-edit button[type="submit"] { color: var(--accent-dark); }
+.construction-entry-edit button[type="button"] { color: var(--muted-dark); }
+.construction-history p { margin: 0; color: var(--muted); font-size: 10px; }
+.construction-empty { display: flex; min-height: 190px; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 20px; color: var(--muted); text-align: center; }
+.construction-empty .empty-icon { display: grid; width: 39px; height: 39px; margin-bottom: 3px; place-items: center; border: 1px solid #c6d9d6; border-radius: 5px; color: var(--accent); background: #f3f8f7; }
+.construction-empty .empty-icon svg { width: 21px; height: 21px; }
+.construction-empty strong { color: var(--ink); font-size: 13px; font-weight: 600; }
+.construction-empty > span:not(.empty-icon) { margin-bottom: 7px; font-size: 11px; }
+.construction-empty .quiet-button { width: auto; font-size: 11px; }
+.construction-load-error { display: flex; min-height: 150px; align-items: center; justify-content: center; gap: 14px; color: var(--muted-dark); font-size: 12px; }
 .detail-heading { display: flex; min-height: 70px; align-items: center; justify-content: space-between; gap: 15px; padding: 13px 17px; border-bottom: 1px solid var(--line); }
 .detail-title-wrap { display: flex; align-items: center; gap: 12px; }
 .layer-swatch.large { width: 5px; height: 36px; flex: 0 0 auto; border-radius: 2px; background: var(--layer-color); }
@@ -568,6 +651,62 @@ h1 { margin-bottom: 0; font-size: 23px; font-weight: 600; letter-spacing: -.035e
 .report-summary span { color: #6a787d; font-size: 7px; font-weight: 700; letter-spacing: .06em; }
 .report-summary strong { color: #25383e; font-family: var(--data); font-size: 15px; font-weight: 600; }
 .report-summary small { color: #68767b; font-size: 8px; }
+.construction-report-summary { grid-template-columns: 1fr; }
+.construction-report-summary > div { border-right: 0; }
+.construction-report-table td:first-child { min-width: 0; }
+.construction-report-track { margin-top: 3px; }
+.construction-report-track i { left: 0; background: var(--accent); }
+.construction-photo-dialog { width: min(440px, 100%); }
+.construction-photo-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; padding-top: 13px; border-top: 1px solid var(--line); }
+.construction-report-shell { width: min(1100px, 100%); }
+.construction-print-report { width: 210mm; min-height: 297mm; padding: 9mm; color: #20282b; font-size: 10pt; }
+.construction-report-header { display: flex; align-items: center; justify-content: space-between; padding-bottom: 8px; border-bottom: 2px solid #08745e; }
+.construction-brand-logo { display: block; width: 52mm; max-height: 16mm; object-fit: contain; object-position: left center; }
+.construction-report-meta { display: flex; flex-direction: column; gap: 2px; text-align: right; font-size: 9pt; }
+.construction-print-report > h1 { margin: 9px 0 0; font-size: 21pt; line-height: 1.15; }
+.construction-report-subtitle { margin: 2px 0 9px; font-size: 12pt; }
+.construction-report-overview { display: grid; grid-template-columns: 1fr; gap: 10px; min-height: 43mm; }
+.construction-report-overview.with-photo { grid-template-columns: 1.35fr 1fr; }
+.construction-report-object { display: flex; flex-direction: column; gap: 10px; padding: 12px 15px; border: 1px solid #a9c5cc; border-radius: 8px; background: #f7fafb; }
+.construction-report-object > div { display: grid; grid-template-columns: 34% 1fr; gap: 8px; }
+.construction-report-object > div span { color: #28363a; }
+.construction-report-object > div strong { font-weight: 650; }
+.construction-report-photo { width: 100%; height: 43mm; border: 1px solid #c7d8dc; border-radius: 8px; object-fit: cover; }
+.construction-report-progress, .construction-report-card { overflow: hidden; border: 1px solid #a9cbd4; border-radius: 8px; background: #fff; }
+.construction-report-progress { margin-top: 8px; }
+.construction-report-progress h2, .construction-report-card h2 { margin: 0; padding: 5px 10px; background: #e8f4f4; font-size: 11pt; }
+.construction-report-progress-body { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 7px 11px; }
+.construction-report-progress-body > strong { color: #08745e; font-size: 25pt; line-height: 1; }
+.construction-report-progress-body > strong small { font-size: 14pt; }
+.construction-report-progress-track { height: 10px; overflow: hidden; border-radius: 8px; background: #d4dfe3; }
+.construction-report-progress-track i { display: block; height: 100%; border-radius: inherit; background: #16a565; }
+.construction-report-progress-body > span { white-space: nowrap; font-size: 8pt; }
+.construction-report-charts { display: grid; grid-template-columns: 1fr; margin-top: 8px; }
+.construction-donut-layout { display: flex; min-height: 47mm; max-width: 120mm; align-items: center; justify-content: center; gap: 24px; margin: 0 auto; padding: 6px; }
+.construction-donut { position: relative; display: grid; width: 42mm; height: 42mm; flex: 0 0 auto; place-items: center; border-radius: 50%; }
+.construction-donut svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.construction-donut svg circle { fill: none; stroke-width: 16; }
+.construction-donut .construction-donut-remaining { stroke: #d2dbe0; }
+.construction-donut .construction-donut-completed { stroke: #11985b; stroke-linecap: butt; transform: rotate(-90deg); transform-origin: 60px 60px; }
+.construction-donut > div { display: flex; width: 28mm; height: 28mm; align-items: center; justify-content: center; flex-direction: column; border-radius: 50%; background: #fff; text-align: center; }
+.construction-donut strong { font-size: 17pt; }
+.construction-donut span { font-size: 8pt; }
+.construction-donut-legend { display: grid; gap: 8px; font-size: 8pt; }
+.construction-donut-legend > span { display: grid; grid-template-columns: 10px auto auto; align-items: center; gap: 5px; }
+.construction-donut-legend i { width: 9px; height: 9px; border-radius: 2px; background: #16a565; }
+.construction-donut-legend > span + span i { background: #cbd6db; }
+.construction-report-lines { margin-top: 8px; }
+.construction-report-table { table-layout: fixed; }
+.construction-report-table th, .construction-report-table td { padding: 6px 7px; font-size: 9pt; }
+.construction-report-table th:nth-child(1) { width: 8%; }
+.construction-report-table th:nth-child(2) { width: 28%; }
+.construction-report-table th:nth-child(3) { width: 11%; }
+.construction-report-table th:nth-child(4), .construction-report-table th:nth-child(5) { width: 17%; }
+.construction-report-table th:nth-child(6) { width: 19%; }
+.construction-report-total { background: #edf7f7; font-weight: 650; }
+.construction-report-total td:first-child { text-align: left; }
+.construction-report-total td:last-child strong { color: #078447; }
+.construction-report-footer { display: flex; justify-content: space-between; margin-top: 10px; padding-top: 5px; border-top: 1px solid #08745e; font-size: 8pt; }
 .report-bridge { display: flex; align-items: baseline; gap: 9px; margin: -3px 0 10px; padding: 6px 8px; border: 1px solid #d9e1e0; background: #f7faf9; color: #475a60; font-size: 8px; }
 .report-bridge strong { color: #315f59; }
 .report-section { margin-top: 11px; }
@@ -659,9 +798,10 @@ h1 { margin-bottom: 0; font-size: 23px; font-weight: 600; letter-spacing: -.035e
   .backup-actions .primary-button { width: auto; font-size: 10px; }
   .backup-row .quiet-button { font-size: 9px; }
   .topbar { height: 58px; gap: 10px; padding: 0 12px; }
-  .brand-word { font-size: 16px; }
-  .brand-emblem { width: 30px; height: 30px; }
+  .brand-logo { width: 118px; }
   .object-context { gap: 6px; }
+  .mobile-module-switch { display: block; min-width: 0; }
+  .mobile-module-switch select { max-width: 124px; height: 30px; padding: 0 5px; border: 1px solid var(--line); border-radius: 4px; color: var(--ink-soft); background: #fff; font-size: 10px; }
   .context-label, .demo-tag, .save-state, .database-state > span { display: none; }
   .object-name { max-width: 155px; font-size: 11px; }
   .report-button { width: 32px; height: 32px; padding: 0; }
@@ -707,6 +847,39 @@ h1 { margin-bottom: 0; font-size: 23px; font-weight: 600; letter-spacing: -.035e
   .panel-footer { align-items: flex-start; flex-direction: column; gap: 8px; padding: 10px 12px; }
   .legend { flex-wrap: wrap; gap: 9px 15px; }
   .workspace-footnote { gap: 10px; }
+  .construction-page-heading { align-items: flex-start; }
+  .construction-page-heading h1 { max-width: 250px; font-size: 17px; line-height: 1.2; }
+  .construction-page-heading .page-heading-actions { flex: 0 0 auto; }
+  .construction-guide-dialog { padding: 19px; }
+  .construction-guide-dialog > p { min-height: 0; }
+  .construction-object-name { flex-wrap: wrap; }
+  .construction-summary { grid-template-columns: 1fr auto; gap: 8px 12px; padding: 13px; }
+  .construction-summary-track { grid-column: 1 / -1; grid-row: 2; }
+  .construction-summary-count { grid-column: 1 / -1; }
+  .construction-summary-value { grid-column: 2; grid-row: 1; font-size: 21px; }
+  .construction-summary-copy h2 { font-size: 13px; }
+  .construction-summary-copy p { max-width: 200px; line-height: 1.35; }
+  .construction-panel > .panel-heading { align-items: flex-start; }
+  .construction-panel > .panel-heading p { max-width: 215px; }
+  .construction-panel > .panel-heading .compact-button { width: auto; padding: 0 8px; font-size: 10px; }
+  .construction-editor { padding: 13px 12px; }
+  .construction-form-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .construction-form-grid label:first-child { grid-column: 1 / -1; }
+  .construction-list { padding: 0 11px; }
+  .construction-line-main { grid-template-columns: 24px minmax(80px, 1fr) auto 18px; gap: 7px; padding: 11px 0; }
+  .construction-line-content > strong { font-size: 12px; }
+  .construction-line-content > span:nth-child(2) { font-size: 10px; }
+  .construction-line-percent { font-size: 12px; }
+  .construction-edit-button, .construction-delete-button { width: 26px; height: 29px; }
+  .construction-line-details { grid-template-columns: 1fr; gap: 12px; padding: 0 0 13px 31px; }
+  .construction-progress-form { align-items: flex-end; }
+  .construction-progress-form .primary-button { min-width: 112px; padding: 0 8px; font-size: 10px; }
+  .construction-rename-form { align-items: flex-start; flex-direction: column; }
+  .construction-rename-form label { width: 100%; max-width: none; }
+  .construction-rename-form > div { width: 100%; justify-content: flex-end; }
+  .construction-entry-data { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .construction-entry-actions { align-self: flex-start; }
+  .construction-load-error { align-items: flex-start; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -788,7 +961,7 @@ h1 { margin-bottom: 0; font-size: 23px; font-weight: 600; letter-spacing: -.035e
 }
 
 @media print {
-  @page { size: A4 landscape; margin: 10mm; }
+  @page { size: A4 portrait; margin: 10mm; }
   html, body { width: auto; min-width: 0; height: auto; margin: 0; background: #fff !important; }
   body * { visibility: hidden !important; }
   .report-backdrop, .report-backdrop * { visibility: visible !important; }
@@ -801,4 +974,18 @@ h1 { margin-bottom: 0; font-size: 23px; font-weight: 600; letter-spacing: -.035e
   .report-layer-table thead, .report-segment-table thead { display: table-header-group; }
   .report-layer-table tr, .report-segment-table tr { break-inside: avoid; }
   .report-footer { break-inside: avoid; }
+  .construction-print-report { width: auto; min-height: 0; padding: 0; box-shadow: none; font-size: 11pt; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .construction-print-report > h1 { font-size: 22pt; }
+  .construction-report-meta { font-size: 10pt; }
+  .construction-report-header, .construction-report-overview, .construction-report-progress, .construction-report-charts, .construction-report-footer { break-inside: avoid; }
+  .construction-report-overview { min-height: 43mm; }
+  .construction-report-progress h2, .construction-report-card h2 { font-size: 12pt; }
+  .construction-report-progress-body > span, .construction-donut span { font-size: 10pt; }
+  .construction-donut strong { font-size: 19pt; }
+  .construction-report-lines { break-inside: auto; overflow: visible; }
+  .construction-report-lines .construction-report-table { font-size: 10pt; }
+  .construction-report-lines .construction-report-table th, .construction-report-lines .construction-report-table td { padding: 6px 7px; font-size: 10pt; }
+  .construction-report-lines .construction-report-table thead { display: table-header-group; }
+  .construction-report-lines .construction-report-table tr { break-inside: avoid; }
+  .construction-report-lines .report-track { height: 8px; }
 }
