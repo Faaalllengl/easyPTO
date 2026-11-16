@@ -38,7 +38,8 @@ jobs:
             throw 'Configure the TAURI_SIGNING_PRIVATE_KEY Actions secret before building an installer.'
           }
           $keyPath = Join-Path $env:RUNNER_TEMP 'easypto-updater.key'
-          [System.IO.File]::WriteAllText($keyPath, $env:TAURI_SIGNING_PRIVATE_KEY_SECRET, [System.Text.UTF8Encoding]::new($false))
+          $keyMaterial = $env:TAURI_SIGNING_PRIVATE_KEY_SECRET -replace '\s', ''
+          [System.IO.File]::WriteAllText($keyPath, $keyMaterial, [System.Text.UTF8Encoding]::new($false))
           "TAURI_SIGNING_PRIVATE_KEY=$keyPath" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
       - name: Build Windows installer
         if: github.event_name != 'pull_request'
