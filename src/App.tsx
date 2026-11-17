@@ -3,6 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import easyPtoLogo from "./assets/easypto-logo.svg";
+import easyPtoMark from "./assets/easypto-mark.svg";
 import "./App.css";
 import { exportExcel, exportWord, type ReportSnapshot } from "./report";
 
@@ -68,10 +69,11 @@ type ProjectSnapshot = {
   };
 };
 type ConstructionProgressEntry = { id: string; amount: number; happenedAt: string };
+type ConstructionUnit = "pieces" | "meters" | "kilometers" | "square_meters" | "cubic_meters" | "kilograms" | "tonnes";
 type ConstructionLine = {
   id: string;
   name: string;
-  unit: "pieces" | "meters";
+  unit: ConstructionUnit;
   plannedAmount: number;
   completedAmount: number;
   progressPercent: number;
@@ -79,7 +81,7 @@ type ConstructionLine = {
   entries: ConstructionProgressEntry[];
 };
 type ConstructionSnapshot = { project: ProjectListItem; lines: ConstructionLine[]; progressPercent: number };
-type ConstructionLineForm = { name: string; unit: "pieces" | "meters"; plannedAmount: string };
+type ConstructionLineForm = { name: string; unit: ConstructionUnit; plannedAmount: string };
 type ActiveModule = "layers" | "construction";
 type ConstructionDeleteTarget =
   | { kind: "line"; line: ConstructionLine }
@@ -125,6 +127,16 @@ const formatNumber = (value: number, digits = 2) => new Intl.NumberFormat("ru-RU
 const formatKm = (centiPk: number, digits = 2) => `${formatNumber(centiPk / 1000, digits)} км`;
 const formatPk = (centiPk: number) => formatNumber(centiPk / 100, 2);
 const roundedPercent = (percent: number) => formatNumber(percent, 1);
+const constructionUnits: Record<ConstructionUnit, { label: string; short: string; precision: number; quantity: string }> = {
+  pieces: { label: "Штуки", short: "шт", precision: 0, quantity: "количество" },
+  meters: { label: "Метры", short: "м", precision: 2, quantity: "длина" },
+  kilometers: { label: "Километры", short: "км", precision: 3, quantity: "длина" },
+  square_meters: { label: "Квадратные метры", short: "м²", precision: 2, quantity: "площадь" },
+  cubic_meters: { label: "Кубические метры", short: "м³", precision: 3, quantity: "объём" },
+  kilograms: { label: "Килограммы", short: "кг", precision: 3, quantity: "масса" },
+  tonnes: { label: "Тонны", short: "т", precision: 3, quantity: "масса" },
+};
+const unitMeta = (unit: ConstructionUnit) => constructionUnits[unit];
 const formatDate = (value: string | null) => value ? new Intl.DateTimeFormat("ru-RU").format(new Date(`${value}T00:00:00`)) : "";
 const formatTimestamp = (value: string) => value ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(value)) : "Дата неизвестна";
 const asCentiPk = (value: string): number | null => {
@@ -1108,19 +1120,19 @@ function App() {
                   {constructionLineEditorOpen && <form className="construction-editor" onSubmit={saveConstructionLine}>
                     <div className="construction-form-grid">
                       <label>Название линии<input autoFocus required maxLength={160} value={constructionLineForm.name} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, name: event.currentTarget.value })} placeholder="Например, установка дорожных знаков" /></label>
-                      <label>Единица измерения<select value={constructionLineForm.unit} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, unit: event.currentTarget.value as ConstructionLineForm["unit"] })}><option value="meters">Метры</option><option value="pieces">Штуки</option></select></label>
-                      <label>{constructionLineForm.unit === "meters" ? "Проектная протяжённость, м" : "Проектное количество, шт"}<input required type="number" min={constructionLineForm.unit === "meters" ? "0.01" : "1"} step={constructionLineForm.unit === "meters" ? "0.01" : "1"} inputMode="decimal" value={constructionLineForm.plannedAmount} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, plannedAmount: event.currentTarget.value })} /></label>
+                      <label>Единица измерения<select value={constructionLineForm.unit} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, unit: event.currentTarget.value as ConstructionUnit })}>{Object.entries(constructionUnits).map(([value, unit]) => <option key={value} value={value}>{unit.label}</option>)}</select></label>
+                      <label>Плановый {unitMeta(constructionLineForm.unit).quantity}, {unitMeta(constructionLineForm.unit).short}<input required type="number" min={unitMeta(constructionLineForm.unit).precision ? 10 ** -unitMeta(constructionLineForm.unit).precision : "1"} step={unitMeta(constructionLineForm.unit).precision ? 10 ** -unitMeta(constructionLineForm.unit).precision : "1"} inputMode="decimal" value={constructionLineForm.plannedAmount} onChange={(event) => setConstructionLineForm({ ...constructionLineForm, plannedAmount: event.currentTarget.value })} /></label>
                     </div>
                     <div className="form-footer"><span className="form-hint">Фактические объёмы добавляются в эту линию по мере выполнения работ.</span><div><button className="quiet-button" type="button" onClick={() => setConstructionLineEditorOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Создать линию"}</button></div></div>
                   </form>}
                   {constructionSnapshot.lines.length ? <div className="construction-list">{constructionSnapshot.lines.map((line, index) => {
                     const expanded = activeConstructionLineId === line.id;
-                    const unitShort = line.unit === "meters" ? "м" : "шт";
+                    const { short: unitShort, precision } = unitMeta(line.unit);
                     return <article className={`construction-line${expanded ? " expanded" : ""}`} key={line.id}>
                       <div className="construction-line-row">
                         <button className="construction-line-main" type="button" onClick={() => { setActiveConstructionLineId(expanded ? null : line.id); setConstructionProgressAmount(""); setEditingConstructionLineId(null); setEditingConstructionEntryId(null); }} aria-expanded={expanded}>
                           <span className="construction-line-index mono">{String(index + 1).padStart(2, "0")}</span>
-                          <span className="construction-line-content"><strong>{line.name}</strong><span>Выполнено {formatNumber(line.completedAmount, line.unit === "meters" ? 2 : 0)} из {formatNumber(line.plannedAmount, line.unit === "meters" ? 2 : 0)} {unitShort}</span><span className="construction-line-track" aria-hidden="true"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></span></span>
+                          <span className="construction-line-content"><strong>{line.name}</strong><span>Выполнено {formatNumber(line.completedAmount, precision)} из {formatNumber(line.plannedAmount, precision)} {unitShort}</span><span className="construction-line-track" aria-hidden="true"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></span></span>
                           <strong className="construction-line-percent">{roundedPercent(line.progressPercent)}%</strong>
                           <span className="construction-line-chevron" aria-hidden="true"><ChevronIcon expanded={expanded} /></span>
                         </button>
@@ -1133,15 +1145,15 @@ function App() {
                           <div><button className="quiet-button" type="button" onClick={() => setEditingConstructionLineId(null)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Сохранить название"}</button></div>
                         </form>}
                         <form className="construction-progress-form" onSubmit={(event) => { event.preventDefault(); void addConstructionProgress(line); }}>
-                          <label>Добавить выполненный объём, {unitShort}<input required type="number" min={line.unit === "meters" ? "0.01" : "1"} step={line.unit === "meters" ? "0.01" : "1"} inputMode="decimal" value={constructionProgressAmount} onChange={(event) => setConstructionProgressAmount(event.currentTarget.value)} /></label>
+                          <label>Добавить выполненный объём, {unitShort}<input required type="number" min={precision ? 10 ** -precision : "1"} step={precision ? 10 ** -precision : "1"} inputMode="decimal" value={constructionProgressAmount} onChange={(event) => setConstructionProgressAmount(event.currentTarget.value)} /></label>
                           <button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : "Добавить объём"}</button>
                         </form>
                         <div className="construction-history"><strong>Записи выполнения · {line.entries.length}</strong>{line.entries.length ? <ol>{line.entries.map((entry) => <li key={entry.id}>
                           {editingConstructionEntryId === entry.id ? <form className="construction-entry-edit" onSubmit={(event) => void saveConstructionEntry(event, line, entry)}>
-                            <label><span className="visually-hidden">Исправить объём, {unitShort}</span><input required type="number" min={line.unit === "meters" ? "0.01" : "1"} step={line.unit === "meters" ? "0.01" : "1"} inputMode="decimal" value={constructionEntryAmount} onChange={(event) => setConstructionEntryAmount(event.currentTarget.value)} /></label>
+                            <label><span className="visually-hidden">Исправить объём, {unitShort}</span><input required type="number" min={precision ? 10 ** -precision : "1"} step={precision ? 10 ** -precision : "1"} inputMode="decimal" value={constructionEntryAmount} onChange={(event) => setConstructionEntryAmount(event.currentTarget.value)} /></label>
                             <button type="submit" disabled={saving} aria-label="Сохранить объём"><CheckIcon /></button><button type="button" onClick={() => setEditingConstructionEntryId(null)} aria-label="Отменить изменение"><CloseIcon /></button>
                           </form> : <>
-                            <div className="construction-entry-data"><time>{formatTimestamp(entry.happenedAt)}</time><span>+{formatNumber(entry.amount, line.unit === "meters" ? 2 : 0)} {unitShort}</span></div>
+                            <div className="construction-entry-data"><time>{formatTimestamp(entry.happenedAt)}</time><span>+{formatNumber(entry.amount, precision)} {unitShort}</span></div>
                             <div className="construction-entry-actions"><button type="button" onClick={() => { setEditingConstructionEntryId(entry.id); setConstructionEntryAmount(String(entry.amount)); }} aria-label="Изменить запись"><EditIcon /></button><button type="button" onClick={(event) => { event.stopPropagation(); removeConstructionEntry(line, entry); }} aria-label="Удалить запись" disabled={saving}><TrashIcon /></button></div>
                           </>}
                         </li>)}</ol> : <p>Записей пока нет. Добавьте первый выполненный объём.</p>}</div>
@@ -1344,19 +1356,19 @@ function App() {
       {constructionReportOpen && constructionSnapshot && <div className="report-backdrop"><section className="report-shell construction-report-shell" role="dialog" aria-modal="true" aria-labelledby="construction-report-title">
         <div className="report-toolbar"><button className="quiet-button" type="button" onClick={() => setConstructionReportOpen(false)}>Назад</button><div><strong>Отчёт о выполнении работ</strong><span>Для сохранения выберите «Microsoft Print to PDF»</span></div><button className="primary-button" type="button" onClick={() => window.print()}>Печать / PDF</button></div>
         <article className={`print-report construction-print-report${constructionReportPhoto ? " has-report-photo" : ""}`}>
-          <header className="construction-report-header"><img className="construction-brand-logo" src={easyPtoLogo} alt="easyPTO" /><div className="construction-report-meta"><span>Дата формирования: {new Intl.DateTimeFormat("ru-RU").format(new Date())}</span></div></header>
+          <header className="construction-report-header"><img className="construction-brand-logo" src={easyPtoMark} alt="Логотип" /><div className="construction-report-meta"><span>Дата формирования: {new Intl.DateTimeFormat("ru-RU").format(new Date())}</span></div></header>
           <h1 id="construction-report-title">Отчёт о выполнении работ</h1><p className="construction-report-subtitle">Проект строительства автомобильной дороги</p>
           <section className={`construction-report-overview${constructionReportPhoto ? " with-photo" : ""}`}><div className="construction-report-object"><div><span>Объект:</span><strong>{constructionSnapshot.project.name}</strong></div><div><span>Адрес:</span><strong>{constructionSnapshot.project.address || "—"}</strong></div><div><span>Период отчёта:</span><strong>с {new Intl.DateTimeFormat("ru-RU").format(new Date(`${constructionReportStartDate}T00:00:00`))} по {new Intl.DateTimeFormat("ru-RU").format(new Date())}</strong></div></div>{constructionReportPhoto && <img className="construction-report-photo" src={constructionReportPhoto} alt="Фото объекта строительства" />}</section>
           <section className="construction-report-progress"><h2>Общий прогресс по объекту</h2><div className="construction-report-progress-body"><strong>{roundedPercent(constructionSnapshot.progressPercent)}<small>%</small></strong><div className="construction-report-progress-track"><i style={{ width: `${Math.min(100, Math.max(0, constructionSnapshot.progressPercent))}%` }} /></div><span>{constructionSnapshot.lines.length} линии данных</span></div></section>
           <div className="construction-report-charts"><section className="construction-report-card"><h2>Выполнение по линиям данных</h2><div className="construction-donut-layout"><div className="construction-donut"><svg viewBox="0 0 120 120" role="img" aria-label={`Выполнено ${roundedPercent(constructionSnapshot.progressPercent)} процентов`}><circle className="construction-donut-remaining" cx="60" cy="60" r="45" /><circle className="construction-donut-completed" cx="60" cy="60" r="45" strokeDasharray={`${(2 * Math.PI * 45 * Math.min(100, Math.max(0, constructionSnapshot.progressPercent))) / 100} ${2 * Math.PI * 45}`} /></svg><div><strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong><span>общий<br />прогресс</span></div></div><div className="construction-donut-legend"><span><i />Выполнено <strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong></span><span><i />Осталось <strong>{roundedPercent(Math.max(0, 100 - constructionSnapshot.progressPercent))}%</strong></span></div></div></section></div>
-          <section className="construction-report-card construction-report-lines"><h2>Линии данных (объёмы работ)</h2><table className="report-layer-table construction-report-table"><thead><tr><th>№</th><th>Наименование</th><th>Ед. изм.</th><th>Объём (план)</th><th>Выполнено</th><th>Прогресс</th></tr></thead><tbody>{constructionSnapshot.lines.map((line, index) => { const unitShort = line.unit === "meters" ? "м" : "шт"; return <tr key={line.id}><td>{String(index + 1).padStart(2, "0")}</td><td>{line.name}</td><td>{unitShort}</td><td>{formatNumber(line.plannedAmount, line.unit === "meters" ? 2 : 0)}</td><td>{formatNumber(line.completedAmount, line.unit === "meters" ? 2 : 0)}</td><td><strong>{roundedPercent(line.progressPercent)}%</strong><div className="report-track construction-report-track"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></div></td></tr>; })}{!constructionSnapshot.lines.length && <tr><td colSpan={6}>Линий данных пока нет.</td></tr>}<tr className="construction-report-total"><td colSpan={2}>Итого по объекту</td><td>—</td><td>—</td><td>—</td><td><strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong><div className="report-track construction-report-track"><i style={{ width: `${Math.min(100, Math.max(0, constructionSnapshot.progressPercent))}%` }} /></div></td></tr></tbody></table></section>
-          <footer className="construction-report-footer"><strong>easyPTO</strong><span>Страница 1 из 1</span></footer>
+          <section className="construction-report-card construction-report-lines"><h2>Линии данных (объёмы работ)</h2><table className="report-layer-table construction-report-table"><thead><tr><th>№</th><th>Наименование</th><th>Ед. изм.</th><th>Объём (план)</th><th>Выполнено</th><th>Осталось</th><th>Прогресс</th></tr></thead><tbody>{constructionSnapshot.lines.map((line, index) => { const { short, precision } = unitMeta(line.unit); const remainingAmount = Math.max(0, line.plannedAmount - line.completedAmount); return <tr key={line.id}><td>{String(index + 1).padStart(2, "0")}</td><td>{line.name}</td><td>{short}</td><td>{formatNumber(line.plannedAmount, precision)}</td><td>{formatNumber(line.completedAmount, precision)}</td><td>{formatNumber(remainingAmount, precision)} {short}</td><td><strong>{roundedPercent(line.progressPercent)}%</strong><div className="report-track construction-report-track"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></div></td></tr>; })}{!constructionSnapshot.lines.length && <tr><td colSpan={7}>Линий данных пока нет.</td></tr>}<tr className="construction-report-total"><td colSpan={2}>Итого по объекту</td><td>—</td><td>—</td><td>—</td><td>—</td><td><strong>{roundedPercent(constructionSnapshot.progressPercent)}%</strong><div className="report-track construction-report-track"><i style={{ width: `${Math.min(100, Math.max(0, constructionSnapshot.progressPercent))}%` }} /></div></td></tr></tbody></table></section>
+          <footer className="construction-report-footer"><span>Страница 1 из 1</span></footer>
         </article>
       </section></div>}
       {constructionDeleteTarget && <div className="modal-backdrop construction-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setConstructionDeleteTarget(null); }}><section className="project-dialog construction-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="construction-delete-title" aria-describedby="construction-delete-description">
         <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ДАННЫХ</span><h2 id="construction-delete-title">Подтвердите удаление</h2><p id="construction-delete-description">{constructionDeleteTarget.kind === "line"
           ? `Удалить линию «${constructionDeleteTarget.line.name}» и все её записи выполнения? Общий прогресс объекта будет пересчитан.`
-          : `Удалить запись ${formatNumber(constructionDeleteTarget.entry.amount, constructionDeleteTarget.line.unit === "meters" ? 2 : 0)} ${constructionDeleteTarget.line.unit === "meters" ? "м" : "шт"} из линии «${constructionDeleteTarget.line.name}»? Прогресс будет пересчитан.`}</p></div><button className="close-editor" type="button" onClick={() => setConstructionDeleteTarget(null)} disabled={saving} aria-label="Отмена">×</button></div>
+          : `Удалить запись ${formatNumber(constructionDeleteTarget.entry.amount, unitMeta(constructionDeleteTarget.line.unit).precision)} ${unitMeta(constructionDeleteTarget.line.unit).short} из линии «${constructionDeleteTarget.line.name}»? Прогресс будет пересчитан.`}</p></div><button className="close-editor" type="button" onClick={() => setConstructionDeleteTarget(null)} disabled={saving} aria-label="Отмена">×</button></div>
         {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
         <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => { setConstructionDeleteTarget(null); setError(null); }} disabled={saving}>Отмена</button><button className="danger-button" type="button" onClick={() => void confirmConstructionDelete()} disabled={saving}>{saving ? "Удаление…" : "Удалить"}</button></div>
       </section></div>}

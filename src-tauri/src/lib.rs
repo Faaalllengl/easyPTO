@@ -15,8 +15,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, include_str!("../migrations/0002_project_domain.sql")),
     (3, include_str!("../migrations/0003_construction_progress.sql")),
     (4, include_str!("../migrations/0004_project_address.sql")),
+    (5, include_str!("../migrations/0005_construction_units.sql")),
 ];
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -58,10 +59,20 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>
         if target_version != version + 1 {
             return Err(format!("Missing database migration after version {version}").into());
         }
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(sql)?;
-        transaction.pragma_update(None, "user_version", target_version)?;
-        transaction.commit()?;
+        let rebuild_construction_lines = target_version == 5;
+        if rebuild_construction_lines {
+            connection.pragma_update(None, "foreign_keys", "OFF")?;
+        }
+        let migration_result = (|| -> Result<(), rusqlite::Error> {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(sql)?;
+            transaction.pragma_update(None, "user_version", target_version)?;
+            transaction.commit()
+        })();
+        if rebuild_construction_lines {
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        migration_result?;
         version = target_version;
     }
 

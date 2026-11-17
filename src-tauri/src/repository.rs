@@ -106,8 +106,16 @@ fn validate_construction_amount(unit: &str, amount: f64, label: &str) -> Result<
     if unit == "pieces" && amount.fract() != 0.0 {
         return Err(format!("{label}: количество штук должно быть целым числом"));
     }
-    if unit == "meters" && (amount * 100.0 - (amount * 100.0).round()).abs() > 1e-7 {
-        return Err(format!("{label}: длину в метрах укажите с точностью до 0,01"));
+    let precision = match unit {
+        "meters" | "square_meters" => Some(2),
+        "kilometers" | "cubic_meters" | "kilograms" | "tonnes" => Some(3),
+        _ => None,
+    };
+    if let Some(digits) = precision {
+        let scale = 10_f64.powi(digits);
+        if (amount * scale - (amount * scale).round()).abs() > 1e-7 {
+            return Err(format!("{label}: укажите не более {digits} знаков после запятой"));
+        }
     }
     Ok(())
 }
@@ -218,8 +226,8 @@ pub fn create_construction_line(
     if name.is_empty() {
         return Err("Укажите название линии данных".into());
     }
-    if !matches!(input.unit.as_str(), "pieces" | "meters") {
-        return Err("Выберите единицу измерения: штуки или метры".into());
+    if !matches!(input.unit.as_str(), "pieces" | "meters" | "kilometers" | "square_meters" | "cubic_meters" | "kilograms" | "tonnes") {
+        return Err("Выберите единицу измерения из списка".into());
     }
     validate_construction_amount(&input.unit, input.planned_amount, "Проектный объём")?;
     if input.sort_order < 0 {
