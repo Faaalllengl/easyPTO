@@ -21,6 +21,15 @@ export type ReportSnapshot = {
   workAreas: ReportArea[]; exclusions: ReportExclusion[]; layers: ReportLayer[];
   summary: { workAreaLengthCentiPk: number; coveredLengthCentiPk: number; remainingLengthCentiPk: number; progressPercent: number; layersBehindPlan: number };
 };
+export type ConstructionReportSnapshot = {
+  project: { id: string; name: string; address: string };
+  progressPercent: number;
+  lines: Array<{
+    id: string; name: string; unit: "pieces" | "meters" | "kilometers" | "square_meters" | "cubic_meters" | "kilograms" | "tonnes";
+    plannedAmount: number; completedAmount: number; progressPercent: number;
+    entries: Array<{ id: string; amount: number; happenedAt: string }>;
+  }>;
+};
 
 const pk = (centiPk: number) => (centiPk / 100).toFixed(2).replace(".", ",");
 const km = (centiPk: number) => centiPk / 1000;
@@ -30,6 +39,11 @@ const today = () => {
 };
 const safeFilePart = (value: string) => value.replace(/[<>:"/\\|?*]/g, "_").replace(/[. ]+$/g, "").trim() || "Объект";
 const filenameBase = (snapshot: ReportSnapshot) => `${safeFilePart(snapshot.project.name)}_${today()}`;
+const constructionFilenameBase = (snapshot: ConstructionReportSnapshot) => `${safeFilePart(snapshot.project.name)}_строительство_${today()}`;
+const constructionUnitLabel = (unit: ConstructionReportSnapshot["lines"][number]["unit"]) => ({
+  pieces: "шт.", meters: "м", kilometers: "км", square_meters: "м²", cubic_meters: "м³", kilograms: "кг", tonnes: "т",
+}[unit]);
+const constructionDate = (value: string) => new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
 
 async function saveBytes(fileName: string, extension: "xlsx" | "docx", bytes: Uint8Array) {
   const path = await save({
@@ -187,4 +201,77 @@ export async function exportWord(snapshot: ReportSnapshot) {
   });
   const blob = await Packer.toBlob(doc);
   return saveBytes(filenameBase(snapshot), "docx", new Uint8Array(await blob.arrayBuffer()));
+}
+
+export async function exportConstructionExcel(snapshot: ConstructionReportSnapshot) {
+  const ExcelJS = (await import("exceljs")).default;
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "easyPTO";
+  workbook.created = new Date();
+  workbook.subject = `Строительство автомобильной дороги · ${snapshot.project.name}`;
+
+  const summary = workbook.addWorksheet("Сводка", { views: [{ state: "frozen", ySplit: 1 }] });
+  summary.columns = [{ width: 34 }, { width: 28 }, { width: 20 }, { width: 18 }, { width: 18 }];
+  summary.addRow(["easyPTO · Строительство автомобильной дороги"]);
+  summary.mergeCells("A1:E1");
+  summary.getRow(1).font = { bold: true, size: 16, color: { argb: "FF21343B" } };
+  summary.addRows([
+    ["Объект", snapshot.project.name],
+    ["Адрес", snapshot.project.address || "—"],
+    ["Дата отчёта", today()],
+    ["Общий прогресс, %", snapshot.progressPercent],
+    [],
+  ]);
+  const lineHeader = summary.addRow(["Линия работ", "Ед. изм.", "План", "Выполнено", "Прогресс, %"]);
+  lineHeader.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  lineHeader.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF315F59" } };
+  snapshot.lines.forEach((line) => summary.addRow([line.name, constructionUnitLabel(line.unit), line.plannedAmount, line.completedAmount, line.progressPercent]));
+  summary.eachRow((row) => row.eachCell((cell) => { cell.alignment = { vertical: "top", wrapText: true }; }));
+  summary.getColumn(5).numFmt = "0.0";
+  const entries = workbook.addWorksheet("Записи выполнения", { views: [{ state: "frozen", ySplit: 1 }] });
+  entries.columns = [{ header: "Линия работ", key: "line", width: 34 }, { header: "Объём", key: "amount", width: 16 }, { header: "Ед. изм.", key: "unit", width: 14 }, { header: "Дата и время", key: "date", width: 22 }];
+  const entryHeader = entries.getRow(1);
+  entryHeader.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  entryHeader.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF315F59" } };
+  snapshot.lines.forEach((line) => line.entries.forEach((entry) => entries.addRow({ line: line.name, amount: entry.amount, unit: constructionUnitLabel(line.unit), date: constructionDate(entry.happenedAt) })));
+  entries.autoFilter = { from: "A1", to: "D1" };
+  const bytes = await workbook.xlsx.writeBuffer();
+  return saveBytes(constructionFilenameBase(snapshot), "xlsx", new Uint8Array(bytes));
+}
+
+export async function exportConstructionWord(snapshot: ConstructionReportSnapshot) {
+  const { BorderStyle, Document, HeadingLevel, Packer, Paragraph, ShadingType, Table, TableCell, TableRow, TextRun, WidthType } = await import("docx");
+  const cell = (text: string, header = false) => new TableCell({
+    children: [new Paragraph({ children: [new TextRun({ text, bold: header })] })],
+    shading: header ? { type: ShadingType.SOLID, color: "315F59" } : undefined,
+    margins: { top: 80, bottom: 80, left: 100, right: 100 },
+  });
+  const table = (headers: string[], rows: string[][]) => new Table({
+    rows: [new TableRow({ tableHeader: true, cantSplit: true, children: headers.map((item) => cell(item, true)) }),
+      ...rows.map((row) => new TableRow({ cantSplit: true, children: headers.map((_, index) => cell(row[index] ?? "—")) }))],
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    borders: {
+      top: { style: BorderStyle.SINGLE, size: 3, color: "D7DFDF" }, bottom: { style: BorderStyle.SINGLE, size: 3, color: "D7DFDF" },
+      left: { style: BorderStyle.SINGLE, size: 3, color: "D7DFDF" }, right: { style: BorderStyle.SINGLE, size: 3, color: "D7DFDF" },
+      insideHorizontal: { style: BorderStyle.SINGLE, size: 2, color: "E5EAEA" }, insideVertical: { style: BorderStyle.SINGLE, size: 2, color: "E5EAEA" },
+    },
+  });
+  const children = [
+    new Paragraph({ text: "Отчёт о выполнении работ", heading: HeadingLevel.TITLE }),
+    new Paragraph({ text: snapshot.project.name, heading: HeadingLevel.HEADING_1 }),
+    new Paragraph(`Адрес: ${snapshot.project.address || "—"}`),
+    new Paragraph(`Дата формирования: ${new Date().toLocaleDateString("ru-RU")}`),
+    new Paragraph({ text: "Общий прогресс", heading: HeadingLevel.HEADING_1 }),
+    table(["Показатель", "Значение"], [["Выполнение по объекту", `${snapshot.progressPercent.toFixed(1).replace(".", ",")}%`], ["Линий работ", String(snapshot.lines.length)]]),
+    new Paragraph({ text: "Выполнение по линиям", heading: HeadingLevel.HEADING_1 }),
+    table(["Линия", "Ед. изм.", "План", "Выполнено", "Прогресс"], snapshot.lines.map((line) => [line.name, constructionUnitLabel(line.unit), String(line.plannedAmount), String(line.completedAmount), `${line.progressPercent.toFixed(1).replace(".", ",")}%`])),
+    new Paragraph({ text: "Записи выполнения", heading: HeadingLevel.HEADING_1 }),
+    table(["Линия", "Объём", "Ед. изм.", "Дата и время"], snapshot.lines.flatMap((line) => line.entries.map((entry) => [line.name, String(entry.amount), constructionUnitLabel(line.unit), constructionDate(entry.happenedAt)]))),
+  ];
+  const doc = new Document({
+    creator: "easyPTO", title: `Отчёт о выполнении работ · ${snapshot.project.name}`,
+    sections: [{ children }],
+  });
+  const blob = await Packer.toBlob(doc);
+  return saveBytes(constructionFilenameBase(snapshot), "docx", new Uint8Array(await blob.arrayBuffer()));
 }

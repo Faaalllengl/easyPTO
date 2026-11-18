@@ -432,6 +432,19 @@ fn update_layer(
 }
 
 #[tauri::command]
+fn reorder_layers(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    ordered_layer_ids: Vec<String>,
+) -> Result<domain::ProjectSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::reorder_layers(&mut connection, &project_id, &ordered_layer_ids)
+}
+
+#[tauri::command]
 fn delete_layer(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -689,6 +702,7 @@ pub fn run() {
             get_project_snapshot,
             create_layer,
             update_layer,
+            reorder_layers,
             delete_layer,
             save_segment,
             delete_segment,

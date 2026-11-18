@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import easyPtoLogo from "./assets/easypto-logo.svg";
+import easyPtoLogoDark from "./assets/easypto-logo-dark.svg";
 import easyPtoMark from "./assets/easypto-mark.svg";
 import "./App.css";
-import { exportExcel, exportWord, type ReportSnapshot } from "./report";
+import { exportConstructionExcel, exportConstructionWord, exportExcel, exportWord, type ReportSnapshot } from "./report";
 
 type DatabaseStatus = { schemaVersion: number; currentSchemaVersion: number };
 type ProjectListItem = {
@@ -82,7 +84,21 @@ type ConstructionLine = {
 };
 type ConstructionSnapshot = { project: ProjectListItem; lines: ConstructionLine[]; progressPercent: number };
 type ConstructionLineForm = { name: string; unit: ConstructionUnit; plannedAmount: string };
-type ActiveModule = "layers" | "construction";
+type ActiveModule = "layers" | "construction" | "settings";
+const getStartupModule = (): "layers" | "construction" => {
+  try {
+    return localStorage.getItem("easypto.startModule") === "construction" ? "construction" : "layers";
+  } catch {
+    return "layers";
+  }
+};
+const getSavedTheme = (): "light" | "dark" => {
+  try {
+    return localStorage.getItem("easypto.theme") === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+};
 type ConstructionDeleteTarget =
   | { kind: "line"; line: ConstructionLine }
   | { kind: "entry"; line: ConstructionLine; entry: ConstructionProgressEntry };
@@ -107,14 +123,12 @@ type LayerInput = {
   code: string;
   name: string;
   color: string;
-  sortOrder: number;
-  baseLayerId: string | null;
   planPercent: number | null;
   planDate: string | null;
 };
 type SegmentInput = { workAreaId: string; fromPk: string; toPk: string; workDate: string; note: string | null };
 type Filter = "all" | "unfinished" | "behind";
-type LayerForm = { code: string; name: string; color: string; sortOrder: string; baseLayerId: string; planPercent: string; planDate: string };
+type LayerForm = { code: string; name: string; color: string; planPercent: string; planDate: string };
 type SegmentForm = { workAreaId: string; fromPk: string; toPk: string; workDate: string; note: string };
 type BridgeForm = { enabled: boolean; fromPk: string; toPk: string; layerIds: string[] };
 type ExclusionForm = { id: string | null; name: string; reason: string; fromPk: string; toPk: string; layerIds: string[]; workAreaIds: string[] };
@@ -178,12 +192,10 @@ const subtractIntervals = (source: Interval[], cuts: Interval[]): Interval[] => 
 };
 const intervalLength = (intervals: Interval[]) => intervals.reduce((total, interval) => total + interval.toCentiPk - interval.fromCentiPk, 0);
 
-const emptyLayerForm = (sortOrder: number): LayerForm => ({
+const emptyLayerForm = (): LayerForm => ({
   code: "",
   name: "",
   color: "#20796e",
-  sortOrder: String(sortOrder),
-  baseLayerId: "",
   planPercent: "",
   planDate: "",
 });
@@ -201,7 +213,10 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [snapshot, setSnapshot] = useState<ProjectSnapshot | null>(null);
   const [constructionSnapshot, setConstructionSnapshot] = useState<ConstructionSnapshot | null>(null);
-  const [activeModule, setActiveModule] = useState<ActiveModule>("layers");
+  const [activeModule, setActiveModule] = useState<ActiveModule>(getStartupModule);
+  const [startupModule, setStartupModule] = useState<"layers" | "construction">(getStartupModule);
+  const [theme, setTheme] = useState<"light" | "dark">(getSavedTheme);
+  const [applicationVersion, setApplicationVersion] = useState("—");
   const [constructionLoading, setConstructionLoading] = useState(false);
   const [constructionLoadAttempt, setConstructionLoadAttempt] = useState(0);
   const [constructionLineEditorOpen, setConstructionLineEditorOpen] = useState(false);
@@ -231,12 +246,15 @@ function App() {
   const [search, setSearch] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [projectDeleteDialogOpen, setProjectDeleteDialogOpen] = useState(false);
   const [projectName, setProjectName] = useState("");
   const [routeStartPk, setRouteStartPk] = useState("0,00");
   const [routeEndPk, setRouteEndPk] = useState("10,00");
   const [layerEditorOpen, setLayerEditorOpen] = useState(false);
+  const [layerOrderEditing, setLayerOrderEditing] = useState(false);
+  const [layerOrderDraft, setLayerOrderDraft] = useState<string[]>([]);
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
-  const [layerForm, setLayerForm] = useState<LayerForm>(emptyLayerForm(0));
+  const [layerForm, setLayerForm] = useState<LayerForm>(emptyLayerForm());
   const [segmentEditorOpen, setSegmentEditorOpen] = useState(false);
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
   const [segmentForm, setSegmentForm] = useState<SegmentForm>(emptySegmentForm());
@@ -252,6 +270,7 @@ function App() {
   const [reportDialogOpen, setReportDialogOpen] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [checkingForUpdates, setCheckingForUpdates] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
   const refreshProjects = async () => {
@@ -305,13 +324,17 @@ function App() {
     }
   };
 
-  const removeSelectedProject = async () => {
+  const removeSelectedProject = () => {
     if (!selectedProjectId || !selectedProject) return;
     if (projects.length <= 1) {
       setError("Нельзя удалить последний объект.");
       return;
     }
-    if (!window.confirm(`Удалить объект «${selectedProject.name}» и все его слои, отрезки и настройки?`)) return;
+    setProjectDeleteDialogOpen(true);
+  };
+
+  const confirmRemoveSelectedProject = async () => {
+    if (!selectedProjectId || !selectedProject || projects.length <= 1) return;
     setSaving(true);
     setError(null);
     try {
@@ -321,6 +344,7 @@ function App() {
       setSelectedProjectId(next.id);
       localStorage.setItem("easypto.activeProjectId", next.id);
       setNotice("Объект удалён.");
+      setProjectDeleteDialogOpen(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -405,6 +429,7 @@ function App() {
 
   useEffect(() => {
     if (!isTauri()) return;
+    void getVersion().then(setApplicationVersion).catch(() => setApplicationVersion("неизвестна"));
     let alive = true;
     const timer = window.setTimeout(() => {
       void check().then((update) => {
@@ -422,6 +447,46 @@ function App() {
       window.clearTimeout(timer);
     };
   }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("easypto.theme", theme);
+    } catch {
+      // The selected theme remains active for this session.
+    }
+  }, [theme]);
+
+  const selectModule = (module: ActiveModule) => {
+    setActiveModule(module);
+  };
+
+  const saveStartupModule = (module: "layers" | "construction") => {
+    setStartupModule(module);
+    try {
+      localStorage.setItem("easypto.startModule", module);
+    } catch {
+      // Keep the preference for this session when browser storage is unavailable.
+    }
+  };
+
+  const checkForUpdates = async () => {
+    if (!isTauri()) {
+      setNotice("Проверка обновлений доступна в установленной версии приложения.");
+      return;
+    }
+    setCheckingForUpdates(true);
+    setUpdateError(null);
+    try {
+      const update = await check();
+      if (update) setAvailableUpdate(update);
+      else setNotice("Установлена последняя версия easyPTO.");
+    } catch (reason) {
+      setUpdateError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setCheckingForUpdates(false);
+    }
+  };
 
   const dismissUpdate = async () => {
     await availableUpdate?.close();
@@ -661,6 +726,10 @@ function App() {
     if (filter === "behind") return allLayers.filter((layer) => layer.planDeltaPp !== null && layer.planDeltaPp < 0);
     return allLayers;
   }, [filter, snapshot]);
+  const layerOrderChanged = Boolean(snapshot && (
+    layerOrderDraft.length !== snapshot.layers.length
+    || layerOrderDraft.some((layerId, index) => snapshot.layers[index]?.id !== layerId)
+  ));
 
   const bridgeArea = snapshot?.workAreas.find((area) => area.id === snapshot.bridgeAreaId) ?? null;
   const bridgeLayers = bridgeArea ? snapshot?.layers.filter((layer) => layer.workAreaIds.includes(bridgeArea.id)) ?? [] : [];
@@ -708,10 +777,57 @@ function App() {
 
   const beginCreateLayer = () => {
     setEditingLayerId(null);
-    setLayerForm(emptyLayerForm(snapshot?.layers.length ?? 0));
+    setLayerForm(emptyLayerForm());
     setLayerEditorOpen(true);
     setSegmentEditorOpen(false);
     setError(null);
+  };
+
+  const beginLayerOrderEdit = () => {
+    if (!snapshot) return;
+    setLayerOrderDraft(snapshot.layers.map((layer) => layer.id));
+    setLayerOrderEditing(true);
+    setLayerEditorOpen(false);
+    setSegmentEditorOpen(false);
+    setFilter("all");
+    setSearch("");
+    setError(null);
+  };
+
+  const moveLayerInOrder = (index: number, offset: -1 | 1) => {
+    const nextIndex = index + offset;
+    if (nextIndex < 0 || nextIndex >= layerOrderDraft.length) return;
+    setLayerOrderDraft((current) => {
+      const reordered = [...current];
+      [reordered[index], reordered[nextIndex]] = [reordered[nextIndex], reordered[index]];
+      return reordered;
+    });
+  };
+
+  const saveLayerOrder = async () => {
+    if (!snapshot || !selectedProjectId || !layerOrderChanged) return;
+    if (!window.confirm("Сохранить новый порядок? Базой каждого слоя станет следующий слой ниже, а у нижнего слоя базового слоя не будет.")) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<ProjectSnapshot>("reorder_layers", {
+        projectId: selectedProjectId,
+        orderedLayerIds: layerOrderDraft,
+      });
+      adoptSnapshot(updated);
+      setLayerOrderEditing(false);
+      setNotice("Порядок слоёв и базовые слои обновлены.");
+      await refreshProjects();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cancelLayerOrderEdit = () => {
+    setLayerOrderEditing(false);
+    setLayerOrderDraft([]);
   };
 
   const beginEditLayer = (layer: LayerSnapshot) => {
@@ -720,8 +836,6 @@ function App() {
       code: layer.code,
       name: layer.name,
       color: layer.color,
-      sortOrder: String(layer.sortOrder),
-      baseLayerId: layer.baseLayerId ?? "",
       planPercent: layer.planPercent === null ? "" : String(layer.planPercent).replace(".", ","),
       planDate: layer.planDate ?? "",
     });
@@ -751,8 +865,6 @@ function App() {
         code: layerForm.code,
         name: layerForm.name,
         color: layerForm.color,
-        sortOrder: Number(layerForm.sortOrder),
-        baseLayerId: layerForm.baseLayerId || null,
         planPercent,
         planDate: layerForm.planDate || null,
       };
@@ -1042,6 +1154,23 @@ function App() {
     }
   };
 
+  const canExportConstructionSnapshot = () => Boolean(constructionSnapshot && constructionSnapshot.project.id === selectedProjectId && !saving && !error);
+  const runConstructionExport = async (format: "excel" | "word") => {
+    if (!canExportConstructionSnapshot() || !constructionSnapshot) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const saved = format === "excel"
+        ? await exportConstructionExcel(constructionSnapshot)
+        : await exportConstructionWord(constructionSnapshot);
+      if (saved) setNotice(format === "excel" ? "Файл Excel сохранён." : "Файл Word сохранён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const constructionReportStartDate = useMemo(() => {
     const dates = constructionSnapshot?.lines.flatMap((line) => line.entries.map((entry) => entry.happenedAt.slice(0, 10))).sort();
     return dates?.[0] ?? dateToday();
@@ -1051,18 +1180,18 @@ function App() {
     <div className="application">
       <header className="topbar">
         <a className="brand" href="#workspace" aria-label="easyPTO — рабочая область">
-          <img className="brand-logo" src={easyPtoLogo} alt="" />
+          <img className="brand-logo" src={theme === "dark" ? easyPtoLogoDark : easyPtoLogo} alt="" />
         </a>
         <div className="topbar-divider" />
         <label className="object-context">
           <span className="context-label">ОБЪЕКТ</span>
-          <select className="object-select" aria-label="Выбрать объект" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={!projects.length}>
+          <select className="object-select" aria-label="Выбрать объект" value={selectedProjectId} onChange={(event) => { cancelLayerOrderEdit(); setSelectedProjectId(event.currentTarget.value); }} disabled={!projects.length}>
             {!projects.length && <option value="">Нет объектов</option>}
             {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
           </select>
         </label>
         <button className="new-project-button" type="button" onClick={() => setProjectDialogOpen(true)} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
-        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать модуль</span><select aria-label="Выбрать модуль" value={activeModule} onChange={(event) => setActiveModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option></select></label>
+        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать раздел</span><select aria-label="Выбрать раздел" value={activeModule} onChange={(event) => selectModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option><option value="settings">Настройки</option></select></label>
         <div className="topbar-spacer" />
         <div className={`save-state${saving ? " is-saving" : ""}${error ? " is-error" : ""}`} aria-live="polite">
           <span className="save-dot" />
@@ -1073,19 +1202,43 @@ function App() {
           <DatabaseIcon />
           <span>{databaseStatus ? "Локально" : loading ? "Подключение…" : "База недоступна"}</span>
         </div>
-        {activeModule === "layers" && <button className="report-button" type="button" onClick={openReportPreview} disabled={!snapshot || saving || Boolean(error)} title={error ? "Сначала устраните ошибку сохранения" : "Предпросмотр и печать PDF-отчёта"}><DocumentIcon /><span>Отчёт</span></button>}
       </header>
 
       <div className="workspace" id="workspace">
         <aside className="sidebar" aria-label="Разделы приложения">
           <div className="sidebar-caption">РАБОЧЕЕ МЕСТО</div>
-          <button className={`nav-item${activeModule === "layers" ? " active" : ""}`} type="button" aria-current={activeModule === "layers" ? "page" : undefined} onClick={() => setActiveModule("layers")} title="Слои дорожной одежды"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></button>
-          <button className={`nav-item construction-nav-item${activeModule === "construction" ? " active" : ""}`} type="button" aria-current={activeModule === "construction" ? "page" : undefined} onClick={() => setActiveModule("construction")} title="Строительство автомобильной дороги"><ConstructionIcon /><span>Строительство автомобильной дороги</span><span className="nav-count">{constructionSnapshot?.lines.length ?? 0}</span></button>
+          <button className={`nav-item${activeModule === "layers" ? " active" : ""}`} type="button" aria-current={activeModule === "layers" ? "page" : undefined} onClick={() => selectModule("layers")} title="Слои дорожной одежды"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></button>
+          <button className={`nav-item construction-nav-item${activeModule === "construction" ? " active" : ""}`} type="button" aria-current={activeModule === "construction" ? "page" : undefined} onClick={() => selectModule("construction")} title="Строительство автомобильной дороги"><ConstructionIcon /><span>Строительство автомобильной дороги</span><span className="nav-count">{constructionSnapshot?.lines.length ?? 0}</span></button>
+          <div className="sidebar-caption settings-caption">ПРИЛОЖЕНИЕ</div>
+          <button className={`nav-item settings-nav-item${activeModule === "settings" ? " active" : ""}`} type="button" aria-current={activeModule === "settings" ? "page" : undefined} onClick={() => selectModule("settings")} title="Настройки"><SettingsIcon /><span>Настройки</span></button>
           <div className="sidebar-bottom"><span className="local-indicator" /><span>Работа офлайн</span></div>
         </aside>
 
         <main className="main-content">
-          {loading && !snapshot ? <LoadingState /> : !snapshot ? (
+          {activeModule === "settings" ? <>
+            <div className="page-heading settings-page-heading"><div><div className="breadcrumb"><span>easyPTO</span><span className="crumb-separator">/</span><strong>Приложение</strong></div><h1>Настройки</h1><p>Параметры работы и данные easyPTO на этом устройстве.</p></div></div>
+            {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
+            {notice && <div className="inline-message success-message" role="status"><CheckIcon />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="Закрыть сообщение">×</button></div>}
+            <section className="settings-section" aria-labelledby="settings-appearance-title">
+              <div className="settings-section-heading"><h2 id="settings-appearance-title">Внешний вид</h2><p>Настройте оформление интерфейса приложения.</p></div>
+              <label className="settings-row"><span><strong>Тема интерфейса</strong><small>Выбранная тема сохранится для следующих запусков.</small></span><select value={theme} onChange={(event) => setTheme(event.currentTarget.value as "light" | "dark")}><option value="light">Светлая</option><option value="dark">Тёмная</option></select></label>
+            </section>
+            <section className="settings-section" aria-labelledby="settings-workspace-title">
+              <div className="settings-section-heading"><h2 id="settings-workspace-title">Рабочее место</h2><p>Выберите раздел, который будет открываться при следующем запуске.</p></div>
+              <label className="settings-row"><span><strong>Раздел при запуске</strong><small>Можно изменить в любой момент в боковом меню.</small></span><select value={startupModule} onChange={(event) => saveStartupModule(event.currentTarget.value as "layers" | "construction")}><option value="layers">Слои дорожной одежды</option><option value="construction">Строительство</option></select></label>
+              <div className="settings-row"><span><strong>Обучение по строительству</strong><small>Кратко показывает, как вести линии работ и добавлять объёмы.</small></span><button className="quiet-button" type="button" onClick={() => { selectModule("construction"); openConstructionGuide(); }}>Открыть обучение</button></div>
+            </section>
+            <section className="settings-section" aria-labelledby="settings-data-title">
+              <div className="settings-section-heading"><h2 id="settings-data-title">Данные и сохранность</h2><p>Проекты хранятся локально на этом компьютере.</p></div>
+              <div className="settings-row"><span><strong>История и резервные копии</strong><small>Просмотр журнала изменений, создание и восстановление копий.</small></span><button className="quiet-button" type="button" onClick={() => void openHistory()}>Открыть историю</button></div>
+              <div className="settings-row"><span><strong>Создать резервную копию</strong><small>Сохранить копию текущей базы перед важными изменениями.</small></span><button className="quiet-button" type="button" onClick={() => void createManualBackup()} disabled={saving}>{saving ? "Создание…" : "Создать копию"}</button></div>
+            </section>
+            <section className="settings-section" aria-labelledby="settings-app-title">
+              <div className="settings-section-heading"><h2 id="settings-app-title">О приложении</h2><p>Версия и обновления easyPTO.</p></div>
+              <div className="settings-row"><span><strong>Версия приложения</strong><small>easyPTO для рабочего стола</small></span><span className="settings-version">{applicationVersion}</span></div>
+              <div className="settings-row"><span><strong>Обновления</strong><small>{updateError ? `Не удалось проверить: ${updateError}` : "Проверяйте обновления вручную или дождитесь автоматической проверки при запуске."}</small></span><div className="update-check-action"><button className="quiet-button" type="button" onClick={() => void checkForUpdates()} disabled={checkingForUpdates || installingUpdate}>Проверить обновления</button><span className={`update-check-status${checkingForUpdates ? " is-checking" : ""}`} aria-live="polite" aria-atomic="true">{checkingForUpdates && <><i className="update-spinner" aria-hidden="true" />Проверяем…</>}</span></div></div>
+            </section>
+          </> : loading && !snapshot ? <LoadingState /> : !snapshot ? (
             <EmptyProjectState error={error} onCreate={() => setProjectDialogOpen(true)} />
           ) : (
             activeModule === "construction" ? (
@@ -1100,9 +1253,10 @@ function App() {
                     <div className="construction-object-name">
                       <div><span>ОБЪЕКТ</span><strong>{constructionSnapshot.project.name}</strong></div>
                       <div><span>АДРЕС ОБЪЕКТА</span>{constructionAddressEditing ? <form className="construction-address-form" onSubmit={(event) => void saveConstructionAddress(event)}><input autoFocus maxLength={240} value={constructionAddressDraft} onChange={(event) => setConstructionAddressDraft(event.currentTarget.value)} placeholder="Введите адрес объекта" /><button className="compact-button active-action" type="submit" disabled={saving}>Сохранить</button><button className="compact-button" type="button" onClick={() => setConstructionAddressEditing(false)} disabled={saving}>Отмена</button></form> : <button className="construction-address-value" type="button" onClick={() => { setConstructionAddressDraft(constructionSnapshot.project.address); setConstructionAddressEditing(true); }}><strong>{constructionSnapshot.project.address || "Добавить адрес"}</strong><EditIcon /></button>}</div>
+                      <button className="construction-guide-link" type="button" onClick={openConstructionGuide}><HelpIcon /> Обучение</button>
                     </div>
                   </div>
-                  <div className="page-heading-actions"><button className="quiet-button construction-guide-button" type="button" onClick={openConstructionGuide}><HelpIcon /> Обучение</button><button className="quiet-button construction-report-button" type="button" onClick={() => setConstructionReportSetupOpen(true)}><DocumentIcon /> Отчёт</button><button className="quiet-button" type="button" onClick={openHistory}>История и копии</button><details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details></div>
+                  <div className="page-heading-actions"><button className="report-button construction-report-button" type="button" onClick={() => setConstructionReportSetupOpen(true)} disabled={!constructionSnapshot || saving} title="Предпросмотр и печать PDF-отчёта"><DocumentIcon /><span>Отчёт</span></button><details className="export-menu" onClick={(event) => { if ((event.target as HTMLElement).closest("button")) event.currentTarget.open = false; }}><summary><ExportIcon /> Экспорт</summary><div><button type="button" onClick={() => runConstructionExport("excel")} disabled={!canExportConstructionSnapshot()}>Excel (.xlsx)</button><button type="button" onClick={() => runConstructionExport("word")} disabled={!canExportConstructionSnapshot()}>Word (.docx)</button></div></details><button className="quiet-button" type="button" onClick={openHistory}>История и копии</button><details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details></div>
                 </div>
 
                 {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
@@ -1170,7 +1324,7 @@ function App() {
                   <div className="breadcrumb"><span>{snapshot.project.name}</span><span className="crumb-separator">/</span><strong>Слои дорожной одежды</strong></div>
                   <div className="heading-row"><h1>Слои дорожной одежды</h1><span className="layer-total">{snapshot.layers.length} технологических слоёв</span></div>
                 </div>
-                <div className="page-heading-actions"><button className="quiet-button" type="button" onClick={openHistory}>История и копии</button><details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details><details className="export-menu" onClick={(event) => { if ((event.target as HTMLElement).closest("button")) event.currentTarget.open = false; }}><summary><ExportIcon /> Экспорт</summary><div><button type="button" onClick={() => runExport("excel")} disabled={!canExportCurrentSnapshot()}>Excel (.xlsx)</button><button type="button" onClick={() => runExport("word")} disabled={!canExportCurrentSnapshot()}>Word (.docx)</button><button type="button" onClick={openReportPreview} disabled={!canExportCurrentSnapshot()}>PDF / печать</button></div></details></div>
+                <div className="page-heading-actions"><button className="report-button" type="button" onClick={openReportPreview} disabled={!snapshot || saving || Boolean(error)} title={error ? "Сначала устраните ошибку сохранения" : "Предпросмотр и печать PDF-отчёта"}><DocumentIcon /><span>Отчёт</span></button><details className="export-menu" onClick={(event) => { if ((event.target as HTMLElement).closest("button")) event.currentTarget.open = false; }}><summary><ExportIcon /> Экспорт</summary><div><button type="button" onClick={() => runExport("excel")} disabled={!canExportCurrentSnapshot()}>Excel (.xlsx)</button><button type="button" onClick={() => runExport("word")} disabled={!canExportCurrentSnapshot()}>Word (.docx)</button></div></details><button className="quiet-button" type="button" onClick={openHistory}>История и копии</button><details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details></div>
               </div>
 
               {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
@@ -1192,8 +1346,8 @@ function App() {
               </section>
 
               <section className="layers-panel" aria-labelledby="layers-title">
-                <div className="panel-heading"><div><h2 id="layers-title">Выполнение по пикетажу</h2><p>Факт, план и доступный фронт на общей шкале трассы</p></div><div className="layer-actions"><button className="compact-button active-action" type="button" onClick={beginCreateLayer}><PlusIcon /> Добавить слой</button></div></div>
-                <div className="table-toolbar">
+                <div className="panel-heading"><div><h2 id="layers-title">Выполнение по пикетажу</h2><p>Факт, план и доступный фронт на общей шкале трассы</p></div><div className="layer-actions">{layerOrderEditing ? <><button className="quiet-button" type="button" onClick={cancelLayerOrderEdit} disabled={saving}>Отмена</button><button className="compact-button active-action" type="button" onClick={saveLayerOrder} disabled={saving || !layerOrderChanged}>{saving ? "Сохранение…" : "Сохранить порядок"}</button></> : <><button className="quiet-button" type="button" onClick={beginLayerOrderEdit} disabled={saving}>Порядок слоёв</button><button className="compact-button active-action" type="button" onClick={beginCreateLayer} disabled={saving}><PlusIcon /> Добавить слой</button></>}</div></div>
+                {!layerOrderEditing && <div className="table-toolbar">
                   <label className="search-box"><SearchIcon /><input aria-label="Найти пикет" type="text" inputMode="decimal" placeholder={`Найти ПК, ${formatPk(snapshot.project.routeStart)}`} value={search} onChange={(event) => setSearch(event.currentTarget.value)} onFocus={() => setSearchFocused(true)} onBlur={() => setSearchFocused(false)} />{search && <button className="clear-search" type="button" onClick={() => setSearch("")} aria-label="Очистить поиск">×</button>}</label>
                   <div className="filter-group" role="group" aria-label="Фильтр слоёв">
                     <button className={filter === "all" ? "filter-button selected" : "filter-button"} onClick={() => setFilter("all")} type="button">Все <span>{snapshot.layers.length}</span></button>
@@ -1201,32 +1355,42 @@ function App() {
                     <button className={filter === "behind" ? "filter-button selected" : "filter-button"} onClick={() => setFilter("behind")} type="button">Ниже плана <span>{snapshot.summary.layersBehindPlan}</span></button>
                   </div>
                   <span className="table-result-count">{visibleLayers.length} из {snapshot.layers.length}</span>
-                </div>
+                </div>}
 
-                <div className="table-scroll">
+                {layerOrderEditing ? <div className="layer-order-editor">
+                  <div className="layer-order-intro"><strong>Перемещайте слои стрелками</strong><span>После сохранения базой каждого слоя станет слой сразу под ним.</span></div>
+                  <ol className="layer-order-list">{layerOrderDraft.map((layerId, index) => {
+                    const layer = snapshot.layers.find((item) => item.id === layerId);
+                    if (!layer) return null;
+                    const baseLayer = snapshot.layers.find((item) => item.id === layerOrderDraft[index + 1]);
+                    return <li className="layer-order-row" key={layer.id} style={{ "--layer-color": layer.color } as CSSProperties}>
+                      <span className="layer-order-index mono">{String(index + 1).padStart(2, "0")}</span><span className="layer-swatch" /><strong>{layer.name}</strong>
+                      <span className="layer-order-base">База: {baseLayer?.name ?? "Вся рабочая область"}</span>
+                      <span className="layer-order-controls"><button type="button" onClick={() => moveLayerInOrder(index, -1)} disabled={index === 0} aria-label={`Переместить слой «${layer.name}» выше`} title="Выше">↑</button><button type="button" onClick={() => moveLayerInOrder(index, 1)} disabled={index === layerOrderDraft.length - 1} aria-label={`Переместить слой «${layer.name}» ниже`} title="Ниже">↓</button></span>
+                    </li>;
+                  })}</ol>
+                </div> : <div className="table-scroll">
                   <div className="layer-grid table-head"><div className="head-layer">СЛОЙ</div><div className="head-fact">ФАКТ</div><div className="head-plan">ПЛАН · ДАТА</div><div className="head-delta">Δ П.П.</div><div className="head-front">ФРОНТ</div><div className="head-scale"><div className="scale-title">ПИКЕТАЖНАЯ ШКАЛА</div><div className="scale-values mono">{[0, 25, 50, 75, 100].map((fraction) => <span key={fraction}>{formatPk(Math.round(snapshot.project.routeStart + (snapshot.project.routeEnd - snapshot.project.routeStart) * fraction / 100))}{fraction === 100 ? " ПК" : ""}</span>)}</div></div></div>
                   <div className="layer-list">
                     {visibleLayers.map((layer) => <LayerRow key={layer.id} layer={layer} project={snapshot.project} searchPosition={currentFilterPosition} selected={selectedLayerId === layer.id} onSelect={() => { setSelectedLayerId(layer.id); setLayerEditorOpen(false); setSegmentEditorOpen(false); }} />)}
                     {!visibleLayers.length && <div className="empty-filter"><span className="empty-icon">✓</span><strong>Под фильтр не попали слои</strong><span>Смените фильтр или добавьте новый слой.</span></div>}
                   </div>
-                </div>
-                {search && currentFilterPosition === null && <p className="search-hint" role="status">Введите координату в границах трассы с точностью до 0,01 ПК.</p>}
-                {searchFocused && currentFilterPosition !== null && <div className="search-result"><span className="search-result-marker" />ПК {search.trim()} отмечен на шкале трассы.</div>}
-                <footer className="panel-footer"><div className="legend"><span><i className="legend-complete" />Выполнено</span><span><i className="legend-front" />Доступный фронт</span><span><i className="legend-track" />Граница трассы</span></div><span className="footer-note"><InfoIcon /> Полосы показаны в масштабе всей трассы</span></footer>
+                </div>}
+                {!layerOrderEditing && search && currentFilterPosition === null && <p className="search-hint" role="status">Введите координату в границах трассы с точностью до 0,01 ПК.</p>}
+                {!layerOrderEditing && searchFocused && currentFilterPosition !== null && <div className="search-result"><span className="search-result-marker" />ПК {search.trim()} отмечен на шкале трассы.</div>}
+                {!layerOrderEditing && <footer className="panel-footer"><div className="legend"><span><i className="legend-complete" />Выполнено</span><span><i className="legend-front" />Доступный фронт</span><span><i className="legend-track" />Граница трассы</span></div><span className="footer-note"><InfoIcon /> Полосы показаны в масштабе всей трассы</span></footer>}
               </section>
 
-              {selectedLayer && <section className="layer-detail" aria-labelledby="selected-layer-title">
+              {selectedLayer && !layerOrderEditing && <section className="layer-detail" aria-labelledby="selected-layer-title">
                 <div className="detail-heading"><div className="detail-title-wrap"><span className="layer-swatch large" style={{ "--layer-color": selectedLayer.color } as CSSProperties} /><div><div className="field-label">ВЫБРАННЫЙ СЛОЙ · {selectedLayer.code}</div><h2 id="selected-layer-title">{selectedLayer.name}</h2></div></div><div className="detail-actions"><button className="quiet-button" type="button" onClick={() => beginEditLayer(selectedLayer)}><EditIcon /> Изменить слой</button><button className="compact-button active-action" type="button" onClick={beginCreateSegment}><PlusIcon /> Добавить отрезок</button></div></div>
                 <div className="detail-metrics"><div><span>ФАКТ</span><strong>{roundedPercent(selectedLayer.progressPercent)}%</strong><small>{formatKm(selectedLayer.coveredLengthCentiPk)} из {formatKm(selectedLayer.workAreaLengthCentiPk)}</small></div><div><span>ОСТАЛОСЬ</span><strong>{formatKm(selectedLayer.remainingLengthCentiPk)}</strong><small>в рабочей области слоя</small></div><div><span>ФРОНТ</span><strong>{formatKm(selectedLayer.frontLengthCentiPk)}</strong><small>{selectedLayer.baseLayerId ? `по базовому слою «${snapshot.layers.find((layer) => layer.id === selectedLayer.baseLayerId)?.name ?? ""}»` : "по всей рабочей области"}</small></div><div><span>ПЛАН</span><strong>{selectedLayer.planPercent === null ? "Не задан" : `${formatNumber(selectedLayer.planPercent, 1)}%`}</strong><small>{selectedLayer.planDate ? `на ${formatDate(selectedLayer.planDate)}` : "укажите процент и дату"}</small></div></div>
 
                 {layerEditorOpen && <form className="editor-form layer-form" onSubmit={submitLayer}>
-                  <div className="form-title"><div><h3>{editingLayerId ? "Параметры слоя" : "Новый слой"}</h3><p>Связь с базовым слоем задаётся явно и не меняется при сортировке.</p></div><button className="close-editor" type="button" onClick={closeLayerEditor} aria-label="Закрыть редактор">×</button></div>
+                  <div className="form-title"><div><h3>{editingLayerId ? "Параметры слоя" : "Новый слой"}</h3><p>При изменении порядка базовые слои пересчитываются автоматически.</p></div><button className="close-editor" type="button" onClick={closeLayerEditor} aria-label="Закрыть редактор">×</button></div>
                   <div className="form-grid layer-form-grid">
                     <label>Код<input required maxLength={16} value={layerForm.code} onChange={(event) => setLayerForm({ ...layerForm, code: event.currentTarget.value })} /></label>
                     <label>Название слоя<input required value={layerForm.name} onChange={(event) => setLayerForm({ ...layerForm, name: event.currentTarget.value })} /></label>
                     <label>Цвет<span className="color-input"><input type="color" value={layerForm.color} onChange={(event) => setLayerForm({ ...layerForm, color: event.currentTarget.value })} /><span className="mono">{layerForm.color.toUpperCase()}</span></span></label>
-                    <label>Порядок<input required type="number" min="0" step="1" value={layerForm.sortOrder} onChange={(event) => setLayerForm({ ...layerForm, sortOrder: event.currentTarget.value })} /></label>
-                    <label>Базовый слой<select value={layerForm.baseLayerId} onChange={(event) => setLayerForm({ ...layerForm, baseLayerId: event.currentTarget.value })}><option value="">Нет · вся рабочая область</option>{snapshot.layers.filter((layer) => layer.id !== editingLayerId).map((layer) => <option key={layer.id} value={layer.id}>{layer.name}</option>)}</select></label>
                     <label>План, %<input inputMode="decimal" placeholder="0–100" value={layerForm.planPercent} onChange={(event) => setLayerForm({ ...layerForm, planPercent: event.currentTarget.value })} /></label>
                     <label>Дата плана<input type="date" value={layerForm.planDate} onChange={(event) => setLayerForm({ ...layerForm, planDate: event.currentTarget.value })} /></label>
                   </div>
@@ -1295,13 +1459,11 @@ function App() {
 
               {layerEditorOpen && !selectedLayer && <section className="layer-detail" aria-label="Добавить слой">
                 <form className="editor-form layer-form" onSubmit={submitLayer}>
-                  <div className="form-title"><div><h3>Новый слой</h3><p>Связь с базовым слоем задаётся явно и не меняется при сортировке.</p></div><button className="close-editor" type="button" onClick={closeLayerEditor} aria-label="Закрыть редактор">×</button></div>
+                  <div className="form-title"><div><h3>Новый слой</h3><p>Базовые слои определяются порядком слоёв автоматически.</p></div><button className="close-editor" type="button" onClick={closeLayerEditor} aria-label="Закрыть редактор">×</button></div>
                   <div className="form-grid layer-form-grid">
                     <label>Код<input required maxLength={16} value={layerForm.code} onChange={(event) => setLayerForm({ ...layerForm, code: event.currentTarget.value })} /></label>
                     <label>Название слоя<input required value={layerForm.name} onChange={(event) => setLayerForm({ ...layerForm, name: event.currentTarget.value })} /></label>
                     <label>Цвет<span className="color-input"><input type="color" value={layerForm.color} onChange={(event) => setLayerForm({ ...layerForm, color: event.currentTarget.value })} /><span className="mono">{layerForm.color.toUpperCase()}</span></span></label>
-                    <label>Порядок<input required type="number" min="0" step="1" value={layerForm.sortOrder} onChange={(event) => setLayerForm({ ...layerForm, sortOrder: event.currentTarget.value })} /></label>
-                    <label>Базовый слой<select value={layerForm.baseLayerId} onChange={(event) => setLayerForm({ ...layerForm, baseLayerId: event.currentTarget.value })}><option value="">Нет · вся рабочая область</option>{snapshot.layers.map((layer) => <option key={layer.id} value={layer.id}>{layer.name}</option>)}</select></label>
                     <label>План, %<input inputMode="decimal" placeholder="0–100" value={layerForm.planPercent} onChange={(event) => setLayerForm({ ...layerForm, planPercent: event.currentTarget.value })} /></label>
                     <label>Дата плана<input type="date" value={layerForm.planDate} onChange={(event) => setLayerForm({ ...layerForm, planDate: event.currentTarget.value })} /></label>
                   </div>
@@ -1330,6 +1492,11 @@ function App() {
         <div className="dialog-route"><label>Начало трассы, ПК<input required inputMode="decimal" value={routeStartPk} onChange={(event) => setRouteStartPk(event.currentTarget.value)} /></label><span aria-hidden="true">→</span><label>Конец трассы, ПК<input required inputMode="decimal" value={routeEndPk} onChange={(event) => setRouteEndPk(event.currentTarget.value)} /></label></div>
         <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => setProjectDialogOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Создание…" : "Создать объект"}</button></div>
       </form></div>}
+      {projectDeleteDialogOpen && selectedProject && <div className="modal-backdrop" role="presentation"><section className="project-dialog" role="alertdialog" aria-modal="true" aria-labelledby="project-delete-title" aria-describedby="project-delete-copy">
+        <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ОБЪЕКТА</span><h2 id="project-delete-title">Удалить «{selectedProject.name}»?</h2><p id="project-delete-copy">Будут удалены все слои, отрезки, настройки и история этого объекта. Действие нельзя отменить.</p></div><button className="close-editor" type="button" onClick={() => setProjectDeleteDialogOpen(false)} disabled={saving} aria-label="Отмена">×</button></div>
+        {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
+        <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => setProjectDeleteDialogOpen(false)} disabled={saving}>Оставить объект</button><button className="danger-button" type="button" onClick={() => void confirmRemoveSelectedProject()} disabled={saving}>{saving ? "Удаление…" : "Удалить объект"}</button></div>
+      </section></div>}
       {constructionGuideOpen && <div className="modal-backdrop construction-guide-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeConstructionGuide(); }}><section className="project-dialog construction-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="construction-guide-title" aria-describedby="construction-guide-copy">
         <div className="construction-guide-topline"><span className="field-label">КРАТКОЕ ОБУЧЕНИЕ</span><span>Шаг {constructionGuideStep + 1} из 3</span></div>
         <div className="construction-guide-progress" aria-hidden="true"><i style={{ width: `${((constructionGuideStep + 1) / 3) * 100}%` }} /></div>
@@ -1412,6 +1579,7 @@ function LoadingState() { return <div className="loading-state" role="status"><s
 
 function RoadIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 2 3.8 18M14 2l2.2 16M10 3v3m0 3v3m0 3v2" /></svg>; }
 function ConstructionIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 17V8l4.8-4 4.6 4v9M12.4 11.5h4.8V17M6.4 10.5h2.2m-2.2 3h2.2m6.2 0h.1M2 17h16" /></svg>; }
+function SettingsIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.5" /><path d="m8.4 2.9.5-1h2.2l.5 1 1.2.7 1.1-.2 1.1 1.9-.6.9v1.4l.6.9-1.1 1.9-1.1-.2-1.2.7-.5 1H8.9l-.5-1-1.2-.7-1.1.2L5 8.5l.6-.9V6.2L5 5.3l1.1-1.9 1.1.2 1.2-.7Z" transform="translate(0 2)" /></svg>; }
 function ChevronIcon({ expanded }: { expanded: boolean }) { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d={expanded ? "m5 12 5-5 5 5" : "m5 8 5 5 5-5"} /></svg>; }
 function CloseIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15" /></svg>; }
 function RouteIcon() { return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v4a4 4 0 0 0 4 4h6a4 4 0 0 1 4 4v4M5 4h4M5 4v4m14 12h-4m4 0v-4" /></svg>; }

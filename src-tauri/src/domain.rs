@@ -254,8 +254,6 @@ pub struct LayerInput {
     pub code: String,
     pub name: String,
     pub color: String,
-    pub sort_order: i64,
-    pub base_layer_id: Option<String>,
     pub plan_percent: Option<f64>,
     pub plan_date: Option<String>,
 }

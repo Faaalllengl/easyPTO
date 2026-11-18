@@ -56,9 +56,6 @@ fn validate_layer_input(input: &LayerInput) -> Result<()> {
     {
         return Err("Цвет слоя должен быть в формате #RRGGBB".into());
     }
-    if input.sort_order < 0 {
-        return Err("Порядок слоя не может быть отрицательным".into());
-    }
     match (input.plan_percent, input.plan_date.as_deref()) {
         (None, None) => {}
         (Some(percent), Some(date)) => {
@@ -549,6 +546,60 @@ pub fn delete_project(
     if count <= 1 {
         return Err("Нельзя удалить последний объект".into());
     }
+    // Break the project's cyclic bridge-area reference before removing work
+    // areas. Remove dependent rows explicitly so deletion does not depend on
+    // SQLite's cascade order across the project's cyclic and restrictive FKs.
+    transaction
+        .execute(
+            "UPDATE projects SET bridge_enabled = 0, bridge_area_id = NULL WHERE id = ?1",
+            [project_id],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM segments WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM layer_work_areas WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM exclusion_intervals WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM exclusion_layers WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM exclusion_work_areas WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM exclusions WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM work_area_intervals WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "DELETE FROM construction_progress_entries WHERE project_id = ?1",
+            [project_id],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM construction_lines WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM journal_events WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "UPDATE layers SET base_layer_id = NULL WHERE project_id = ?1",
+            [project_id],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM layers WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
+    transaction
+        .execute("DELETE FROM work_areas WHERE project_id = ?1", [project_id])
+        .map_err(db_error)?;
     let deleted = transaction
         .execute("DELETE FROM projects WHERE id = ?1", [project_id])
         .map_err(db_error)?;
@@ -1497,6 +1548,34 @@ pub fn delete_custom_work_area(
     Ok(snapshot)
 }
 
+fn assign_layer_bases_by_order(connection: &Connection, project_id: &str) -> Result<()> {
+    let mut statement = connection
+        .prepare("SELECT id FROM layers WHERE project_id = ?1 ORDER BY sort_order, id")
+        .map_err(db_error)?;
+    let ordered_layer_ids = statement
+        .query_map([project_id], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+    drop(statement);
+
+    connection
+        .execute(
+            "UPDATE layers SET base_layer_id = NULL WHERE project_id = ?1",
+            [project_id],
+        )
+        .map_err(db_error)?;
+    for (index, layer_id) in ordered_layer_ids.iter().enumerate() {
+        connection
+            .execute(
+                "UPDATE layers SET base_layer_id = ?1 WHERE project_id = ?2 AND id = ?3",
+                params![ordered_layer_ids.get(index + 1), project_id, layer_id],
+            )
+            .map_err(db_error)?;
+    }
+    Ok(())
+}
+
 pub fn create_layer(
     connection: &mut Connection,
     project_id: &str,
@@ -1506,27 +1585,27 @@ pub fn create_layer(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
-    validate_base_layer(
-        &transaction,
-        project_id,
-        None,
-        input.base_layer_id.as_deref(),
-    )?;
+    let sort_order: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM layers WHERE project_id = ?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
 
     let layer_id = id();
     transaction
         .execute(
             "INSERT INTO layers
              (id, project_id, code, name, sort_order, color, base_layer_id, plan_percent, plan_date)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
             params![
                 layer_id,
                 project_id,
                 input.code.trim(),
                 input.name.trim(),
-                input.sort_order,
+                sort_order,
                 input.color.trim(),
-                input.base_layer_id,
                 input.plan_percent,
                 input.plan_date
             ],
@@ -1540,6 +1619,7 @@ pub fn create_layer(
             params![project_id, layer_id],
         )
         .map_err(db_error)?;
+    assign_layer_bases_by_order(&transaction, project_id)?;
     touch_project(
         &transaction,
         project_id,
@@ -1560,23 +1640,15 @@ pub fn update_layer(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
-    validate_base_layer(
-        &transaction,
-        project_id,
-        Some(layer_id),
-        input.base_layer_id.as_deref(),
-    )?;
     let affected = transaction
         .execute(
-            "UPDATE layers SET code = ?1, name = ?2, sort_order = ?3, color = ?4,
-                    base_layer_id = ?5, plan_percent = ?6, plan_date = ?7
-             WHERE project_id = ?8 AND id = ?9",
+            "UPDATE layers SET code = ?1, name = ?2, color = ?3,
+                    plan_percent = ?4, plan_date = ?5
+             WHERE project_id = ?6 AND id = ?7",
             params![
                 input.code.trim(),
                 input.name.trim(),
-                input.sort_order,
                 input.color.trim(),
-                input.base_layer_id,
                 input.plan_percent,
                 input.plan_date,
                 project_id,
@@ -1597,6 +1669,57 @@ pub fn update_layer(
     Ok(snapshot)
 }
 
+pub fn reorder_layers(
+    connection: &mut Connection,
+    project_id: &str,
+    ordered_layer_ids: &[String],
+) -> Result<ProjectSnapshot> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let mut statement = transaction
+        .prepare("SELECT id FROM layers WHERE project_id = ?1")
+        .map_err(db_error)?;
+    let current_layer_ids = statement
+        .query_map([project_id], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<std::result::Result<HashSet<_>, _>>()
+        .map_err(db_error)?;
+    drop(statement);
+    let submitted_layer_ids = ordered_layer_ids.iter().collect::<HashSet<_>>();
+    if ordered_layer_ids.len() != current_layer_ids.len()
+        || submitted_layer_ids.len() != ordered_layer_ids.len()
+        || ordered_layer_ids
+            .iter()
+            .any(|layer_id| !current_layer_ids.contains(layer_id))
+    {
+        return Err("Список слоёв изменился. Обновите объект и попробуйте ещё раз".into());
+    }
+
+    // Clear the existing graph first so any valid new ordering can be applied
+    // without transient cycles or RESTRICT violations between base layers.
+    transaction
+        .execute(
+            "UPDATE layers SET base_layer_id = NULL WHERE project_id = ?1",
+            [project_id],
+        )
+        .map_err(db_error)?;
+    for (index, layer_id) in ordered_layer_ids.iter().enumerate() {
+        let base_layer_id = ordered_layer_ids.get(index + 1);
+        transaction
+            .execute(
+                "UPDATE layers SET sort_order = ?1, base_layer_id = ?2
+                 WHERE project_id = ?3 AND id = ?4",
+                params![index as i64, base_layer_id, project_id, layer_id],
+            )
+            .map_err(db_error)?;
+    }
+    touch_project(&transaction, project_id, "Изменён порядок слоёв и переназначены базовые слои")?;
+    let snapshot = load_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
 pub fn delete_layer(
     connection: &mut Connection,
     project_id: &str,
@@ -1605,19 +1728,24 @@ pub fn delete_layer(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
-    let dependent: Option<String> = transaction
+    let replacement_base_layer_id: Option<Option<String>> = transaction
         .query_row(
-            "SELECT name FROM layers WHERE project_id = ?1 AND base_layer_id = ?2 LIMIT 1",
+            "SELECT base_layer_id FROM layers WHERE project_id = ?1 AND id = ?2",
             params![project_id, layer_id],
             |row| row.get(0),
         )
         .optional()
         .map_err(db_error)?;
-    if let Some(name) = dependent {
-        return Err(format!(
-            "Сначала назначьте другой базовый слой для слоя «{name}»"
-        ));
-    }
+    let Some(replacement_base_layer_id) = replacement_base_layer_id else {
+        return Err("Слой не найден".into());
+    };
+    transaction
+        .execute(
+            "UPDATE layers SET base_layer_id = ?1
+             WHERE project_id = ?2 AND base_layer_id = ?3",
+            params![replacement_base_layer_id, project_id, layer_id],
+        )
+        .map_err(db_error)?;
     transaction
         .execute(
             "DELETE FROM segments WHERE project_id = ?1 AND layer_id = ?2",
@@ -1647,39 +1775,6 @@ pub fn delete_layer(
     let snapshot = load_snapshot(&transaction, project_id)?;
     transaction.commit().map_err(db_error)?;
     Ok(snapshot)
-}
-
-fn validate_base_layer(
-    connection: &Connection,
-    project_id: &str,
-    current_layer_id: Option<&str>,
-    base_layer_id: Option<&str>,
-) -> Result<()> {
-    let Some(mut candidate) = base_layer_id.map(str::to_owned) else {
-        return Ok(());
-    };
-    let mut visited = HashSet::new();
-    loop {
-        if Some(candidate.as_str()) == current_layer_id {
-            return Err("Связь базовых слоёв не может образовывать цикл".into());
-        }
-        if !visited.insert(candidate.clone()) {
-            return Err("В существующих связях базовых слоёв обнаружен цикл".into());
-        }
-        let next: Option<Option<String>> = connection
-            .query_row(
-                "SELECT base_layer_id FROM layers WHERE project_id = ?1 AND id = ?2",
-                params![project_id, candidate],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(db_error)?;
-        match next {
-            None => return Err("Выбранный базовый слой не найден в этом объекте".into()),
-            Some(None) => return Ok(()),
-            Some(Some(next_id)) => candidate = next_id,
-        }
-    }
 }
 
 pub fn save_segment(
