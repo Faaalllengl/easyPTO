@@ -1,0 +1,8 @@
+[Unit]
+Description=Create a verified easyPTO chat database backup
+After=easypto-chat.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/easypto-chat-backup
+UMask=0077

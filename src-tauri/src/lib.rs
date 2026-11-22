@@ -6,6 +6,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, backup::Backup};
 use serde::Serialize;
 use tauri::Manager;
+use keyring::Entry;
 
 pub mod domain;
 mod repository;
@@ -272,6 +273,38 @@ fn database_status(state: tauri::State<'_, AppState>) -> Result<DatabaseStatus, 
         schema_version,
         current_schema_version: CURRENT_SCHEMA_VERSION,
     })
+}
+
+#[tauri::command]
+fn chat_get_session_token() -> Result<Option<String>, String> {
+    let entry = Entry::new("com.easypto.desktop", "chat-session")
+        .map_err(|error| format!("Не удалось открыть хранилище учётных данных: {error}"))?;
+    match entry.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Не удалось прочитать сессию чата: {error}")),
+    }
+}
+
+#[tauri::command]
+fn chat_store_session_token(token: String) -> Result<(), String> {
+    if token.len() < 40 || token.len() > 256 {
+        return Err("Некорректная сессия чата".into());
+    }
+    Entry::new("com.easypto.desktop", "chat-session")
+        .map_err(|error| format!("Не удалось открыть хранилище учётных данных: {error}"))?
+        .set_password(&token)
+        .map_err(|error| format!("Не удалось сохранить сессию чата: {error}"))
+}
+
+#[tauri::command]
+fn chat_clear_session_token() -> Result<(), String> {
+    let entry = Entry::new("com.easypto.desktop", "chat-session")
+        .map_err(|error| format!("Не удалось открыть хранилище учётных данных: {error}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Не удалось удалить сессию чата: {error}")),
+    }
 }
 
 #[tauri::command]
@@ -690,6 +723,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             database_status,
+            chat_get_session_token,
+            chat_store_session_token,
+            chat_clear_session_token,
             list_projects,
             rename_project,
             set_project_address,

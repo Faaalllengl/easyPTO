@@ -156,6 +156,7 @@ button:disabled { cursor: not-allowed; opacity: .56; }
 .nav-item svg { width: 18px; height: 18px; }
 .nav-item.active { color: var(--accent-dark); background: #e7f0ef; }
 .nav-count { margin-left: auto; color: var(--muted); font-family: var(--data); font-size: 11px; }
+.chat-nav-count { min-width: 19px; padding: 0 5px; border-radius: 10px; color: #fff !important; background: var(--accent) !important; font-size: 9px; text-align: center; }
 .construction-nav-item { align-items: flex-start; padding-top: 10px; padding-bottom: 10px; font-size: 11px; line-height: 1.25; }
 .construction-nav-item svg { flex: 0 0 auto; }
 .construction-nav-item .nav-count { padding-top: 1px; }

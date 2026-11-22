@@ -22,3 +22,5 @@ Release publication and auto-update setup are described in [docs/release.md](doc
 The Rust backend owns the SQLite connection. The web UI calls backend commands through Tauri and does not access the database directly. Schema migrations are applied transactionally at application startup; `PRAGMA user_version` records the current schema version.
 
 The Windows CI workflow builds an x64 NSIS installer and stores it as a workflow artifact. It does not publish releases or send project data anywhere.
+
+The optional two-person chat uses the separate ARM64 Rust API in [chat-server](chat-server/README.md). The chat stores only its accounts, sessions, and messages on the configured server; it does not synchronize or upload local project data.

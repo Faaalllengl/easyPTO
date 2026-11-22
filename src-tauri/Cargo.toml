@@ -1,6 +1,6 @@
 [package]
 name = "easypto"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -28,6 +28,7 @@ serde_json = "1"
 rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+keyring = { version = "3", features = ["windows-native"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

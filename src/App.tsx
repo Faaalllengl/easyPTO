@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -8,6 +8,7 @@ import easyPtoLogoDark from "./assets/easypto-logo-dark.svg";
 import easyPtoMark from "./assets/easypto-mark.svg";
 import "./App.css";
 import { exportConstructionExcel, exportConstructionWord, exportExcel, exportWord, type ReportSnapshot } from "./report";
+import { ChatModule } from "./Chat";
 
 type DatabaseStatus = { schemaVersion: number; currentSchemaVersion: number };
 type ProjectListItem = {
@@ -84,7 +85,7 @@ type ConstructionLine = {
 };
 type ConstructionSnapshot = { project: ProjectListItem; lines: ConstructionLine[]; progressPercent: number };
 type ConstructionLineForm = { name: string; unit: ConstructionUnit; plannedAmount: string };
-type ActiveModule = "layers" | "construction" | "settings";
+type ActiveModule = "layers" | "construction" | "chat" | "settings";
 const getStartupModule = (): "layers" | "construction" => {
   try {
     return localStorage.getItem("easypto.startModule") === "construction" ? "construction" : "layers";
@@ -214,6 +215,8 @@ function App() {
   const [snapshot, setSnapshot] = useState<ProjectSnapshot | null>(null);
   const [constructionSnapshot, setConstructionSnapshot] = useState<ConstructionSnapshot | null>(null);
   const [activeModule, setActiveModule] = useState<ActiveModule>(getStartupModule);
+  const [chatUnread, setChatUnread] = useState(0);
+  const updateChatUnread = useCallback((count: number) => setChatUnread(count), []);
   const [startupModule, setStartupModule] = useState<"layers" | "construction">(getStartupModule);
   const [theme, setTheme] = useState<"light" | "dark">(getSavedTheme);
   const [applicationVersion, setApplicationVersion] = useState("—");
@@ -1191,7 +1194,7 @@ function App() {
           </select>
         </label>
         <button className="new-project-button" type="button" onClick={() => setProjectDialogOpen(true)} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
-        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать раздел</span><select aria-label="Выбрать раздел" value={activeModule} onChange={(event) => selectModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option><option value="settings">Настройки</option></select></label>
+        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать раздел</span><select aria-label="Выбрать раздел" value={activeModule} onChange={(event) => selectModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option><option value="chat">Чат{chatUnread ? ` · ${chatUnread}` : ""}</option><option value="settings">Настройки</option></select></label>
         <div className="topbar-spacer" />
         <div className={`save-state${saving ? " is-saving" : ""}${error ? " is-error" : ""}`} aria-live="polite">
           <span className="save-dot" />
@@ -1209,9 +1212,10 @@ function App() {
           <div className="sidebar-caption">РАБОЧЕЕ МЕСТО</div>
           <button className={`nav-item${activeModule === "layers" ? " active" : ""}`} type="button" aria-current={activeModule === "layers" ? "page" : undefined} onClick={() => selectModule("layers")} title="Слои дорожной одежды"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></button>
           <button className={`nav-item construction-nav-item${activeModule === "construction" ? " active" : ""}`} type="button" aria-current={activeModule === "construction" ? "page" : undefined} onClick={() => selectModule("construction")} title="Строительство автомобильной дороги"><ConstructionIcon /><span>Строительство автомобильной дороги</span><span className="nav-count">{constructionSnapshot?.lines.length ?? 0}</span></button>
+          <button className={`nav-item${activeModule === "chat" ? " active" : ""}`} type="button" aria-current={activeModule === "chat" ? "page" : undefined} onClick={() => selectModule("chat")} title="Чат"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 11.6a7.9 7.9 0 0 1-8.1 7.8 8.5 8.5 0 0 1-3.3-.7L4 20l1.2-4.1a7.5 7.5 0 0 1-1.1-4.1A7.9 7.9 0 0 1 12.2 4a7.9 7.9 0 0 1 8 7.6Z" /><path d="M8 11.8h8M8 14.8h5" /></svg><span>Чат</span>{chatUnread > 0 && <span className="nav-count chat-nav-count">{chatUnread > 99 ? "99+" : chatUnread}</span>}</button>
           <div className="sidebar-caption settings-caption">ПРИЛОЖЕНИЕ</div>
           <button className={`nav-item settings-nav-item${activeModule === "settings" ? " active" : ""}`} type="button" aria-current={activeModule === "settings" ? "page" : undefined} onClick={() => selectModule("settings")} title="Настройки"><SettingsIcon /><span>Настройки</span></button>
-          <div className="sidebar-bottom"><span className="local-indicator" /><span>Работа офлайн</span></div>
+          <div className="sidebar-bottom"><span className="local-indicator" /><span>Проекты локально</span></div>
         </aside>
 
         <main className="main-content">
@@ -1477,6 +1481,8 @@ function App() {
           )}
         </main>
       </div>
+
+      <ChatModule active={activeModule === "chat"} onUnreadChange={updateChatUnread} onOpen={() => selectModule("chat")} />
 
       {availableUpdate && <div className="modal-backdrop update-backdrop" role="presentation"><section className="project-dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
         <div className="dialog-heading"><div><span className="field-label">ОБНОВЛЕНИЕ easyPTO</span><h2 id="update-dialog-title">Доступна новая версия</h2><p>Установить easyPTO {availableUpdate.version}? Приложение закроется и запустится снова после установки.</p></div><button className="close-editor" type="button" onClick={() => void dismissUpdate()} disabled={installingUpdate} aria-label="Позже">×</button></div>
