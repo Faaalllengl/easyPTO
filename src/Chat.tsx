@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./Chat.css";
 
@@ -25,6 +25,11 @@ async function request<T>(path: string, token?: string, body?: unknown): Promise
   }
   if (response.status === 204) return undefined as T;
   return await response.json() as T;
+}
+
+function markRead(token: string, lastReadMessageId: number) {
+  // Support both the current camelCase API and older deployed chat servers.
+  return request<void>("/read", token, { lastReadMessageId, last_read_message_id: lastReadMessageId });
 }
 
 function mergeMessages(current: ChatMessage[], next: ChatMessage[]) {
@@ -66,6 +71,7 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [unread, setUnread] = useState(0);
   const [hasMore, setHasMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState("");
@@ -75,11 +81,16 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
   const [loginBusy, setLoginBusy] = useState(false);
   const [connected, setConnected] = useState(false);
   const [toast, setToast] = useState<ChatMessage | null>(null);
+  const latestSeenMessageId = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const scrollHeightBeforeLoad = useRef(0);
+  const scrollTopBeforeLoad = useRef(0);
+  const skipAutoScroll = useRef(false);
   const seenToastIds = useRef(new Set<number>());
   const retryMessage = useRef<{ body: string; id: string } | null>(null);
+  const wasActive = useRef(active);
+  const readBarrier = useRef<Promise<void> | null>(null);
+  latestSeenMessageId.current = Math.max(...messages.filter((message) => message.id > 0).map((message) => message.id), 0);
 
   const partnerName = useMemo(() => user?.username === "owner" ? "Клиент" : "Владелец", [user]);
 
@@ -101,27 +112,36 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
       return;
     }
     let alive = true;
+    const leavingChat = wasActive.current && !active;
+    wasActive.current = active;
+    if (leavingChat && latestSeenMessageId.current > 0) {
+      readBarrier.current = markRead(token, latestSeenMessageId.current);
+    }
     setLoading(true);
-    Promise.all([
-      request<MeResponse>("/auth/me", token),
-      request<HistoryResponse>("/messages?limit=60", token),
-    ]).then(([me, history]) => {
+    (async () => {
+      const history = await request<HistoryResponse>("/messages?limit=60", token);
+      const latestId = Math.max(...history.messages.map((message) => message.id), 0);
+      if ((active || leavingChat) && latestId > 0) {
+        const priorRead = leavingChat ? readBarrier.current : null;
+        const readRequest = markRead(token, latestId);
+        readBarrier.current = readRequest;
+        await Promise.all([readRequest, priorRead?.catch(() => undefined)]);
+        if (readBarrier.current === readRequest) readBarrier.current = null;
+      }
+      const me = await request<MeResponse>("/auth/me", token);
       if (!alive) return;
       setUser(me.user);
-      const unreadCount = active ? 0 : me.unreadCount;
+      const unreadCount = active || leavingChat ? 0 : me.unreadCount;
       setUnread(unreadCount);
       onUnreadChange(unreadCount);
       setMessages(history.messages);
       setHasMore(history.hasMore);
-      if (active) {
-        const latestId = Math.max(...history.messages.map((message) => message.id), 0);
-        if (latestId > 0) void request<void>("/read", token, { lastReadMessageId: latestId }).catch(() => undefined);
-      }
       request<HistoryResponse>("/messages?limit=1", token).then((latest) => {
         if (!alive || latest.messages.length === 0) return;
-        bottomRef.current?.scrollIntoView({ behavior: "instant", block: "end" });
+        const viewport = scrollRef.current;
+        viewport?.scrollTo({ top: viewport.scrollHeight, behavior: "auto" });
       }).catch(() => undefined);
-    }).catch(async (reason: unknown) => {
+    })().catch(async (reason: unknown) => {
       if (!alive) return;
       setError(reason instanceof Error ? reason.message : String(reason));
       if (reason instanceof Error && reason.message.includes("Сессия истекла")) {
@@ -142,6 +162,7 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
     const syncLatest = async () => {
       try {
         const history = await request<HistoryResponse>("/messages?limit=60", token);
+        if (readBarrier.current) await readBarrier.current.catch(() => undefined);
         const me = active ? null : await request<MeResponse>("/auth/me", token);
         if (!alive) return;
         setMessages((current) => {
@@ -161,7 +182,7 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
           const latestId = Math.max(...history.messages.map((message) => message.id), 0);
           setUnread(0);
           onUnreadChange(0);
-          if (latestId > 0) void request<void>("/read", token, { lastReadMessageId: latestId }).catch(() => undefined);
+          if (latestId > 0) void markRead(token, latestId).catch(() => undefined);
         } else if (me) {
           setUnread(me.unreadCount);
           onUnreadChange(me.unreadCount);
@@ -211,14 +232,29 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
     if (latestId === 0) return;
     setUnread(0);
     onUnreadChange(0);
-    void request<void>("/read", token ?? undefined, { lastReadMessageId: latestId }).catch(() => undefined);
+    if (token) void markRead(token, latestId).catch(() => undefined);
   }, [active, user, messages, token, onUnreadChange]);
 
   useEffect(() => {
+    if (skipAutoScroll.current) {
+      skipAutoScroll.current = false;
+      return;
+    }
     if (active && messages.length && scrollHeightBeforeLoad.current === 0) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+      const viewport = scrollRef.current;
+      viewport?.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
     }
   }, [active, messages.length]);
+
+  useLayoutEffect(() => {
+    if (scrollHeightBeforeLoad.current === 0) return;
+    const viewport = scrollRef.current;
+    if (viewport) {
+      viewport.scrollTop = scrollTopBeforeLoad.current + viewport.scrollHeight - scrollHeightBeforeLoad.current;
+    }
+    scrollHeightBeforeLoad.current = 0;
+    scrollTopBeforeLoad.current = 0;
+  }, [messages.length]);
 
   const login = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -275,19 +311,28 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
   };
 
   const loadOlder = async () => {
-    if (!token || !messages.length || !hasMore) return;
-    const viewport = scrollRef.current;
-    if (viewport) scrollHeightBeforeLoad.current = viewport.scrollHeight;
+    if (!token || !messages.length || !hasMore || loadingOlder) return;
+    setLoadingOlder(true);
     try {
       const older = await request<HistoryResponse>(`/messages?limit=60&before=${messages.find((message) => message.id > 0)?.id ?? messages[0].id}`, token);
-      setMessages((current) => mergeMessages(older.messages, current));
+      const currentIds = new Set(messages.map((message) => message.id));
+      const hasNewMessages = older.messages.some((message) => !currentIds.has(message.id));
+      if (hasNewMessages) {
+        const viewport = scrollRef.current;
+        if (viewport) {
+          scrollHeightBeforeLoad.current = viewport.scrollHeight;
+          scrollTopBeforeLoad.current = viewport.scrollTop;
+        }
+        skipAutoScroll.current = true;
+        setMessages((current) => mergeMessages(older.messages, current));
+      }
       setHasMore(older.hasMore);
-      requestAnimationFrame(() => {
-        if (viewport) viewport.scrollTop = viewport.scrollHeight - scrollHeightBeforeLoad.current;
-        scrollHeightBeforeLoad.current = 0;
-      });
     } catch (reason) {
+      scrollHeightBeforeLoad.current = 0;
+      scrollTopBeforeLoad.current = 0;
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoadingOlder(false);
     }
   };
 
@@ -339,12 +384,11 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
           <header className="conversation-header"><span className="conversation-avatar large">{partnerName.slice(0, 1)}</span><div><h2 id="chat-title">{partnerName}</h2><span><i className={connected ? "status-online" : "status-offline"} />{connected ? "В сети" : "Подключаемся…"}</span></div><div className="header-thread-label"><ChatIcon />Личная переписка</div></header>
           {error && <div className="chat-inline-error" role="alert"><span>{error}</span><button type="button" onClick={() => setError("")} aria-label="Закрыть">×</button></div>}
           <div className="message-scroll" ref={scrollRef}>
-            {hasMore && <button className="load-older" type="button" onClick={() => void loadOlder()}>Загрузить предыдущие сообщения</button>}
+            {hasMore && <button className="load-older" type="button" onClick={() => void loadOlder()} disabled={loadingOlder}>{loadingOlder ? "Загружаем…" : "Загрузить предыдущие сообщения"}</button>}
             {loading ? <div className="chat-loading"><span /> Загружаем переписку…</div> : messages.length === 0 ? <div className="chat-empty"><div className="chat-empty-icon"><ChatIcon /></div><strong>Пока тихо</strong><span>Отправьте первое сообщение — оно появится здесь.</span></div> : days.map((group) => <div className="message-day" key={group.label}><div className="day-divider"><span>{group.label}</span></div>{group.messages.map((message) => {
               const own = message.senderId === user.id;
               return <article className={`message-row${own ? " own" : ""}`} key={message.id}><div className="message-avatar">{own ? user.displayName.slice(0, 1) : partnerName.slice(0, 1)}</div><div className="message-content"><div className="message-byline"><strong>{own ? "Вы" : message.senderName}</strong><time>{formatClock(message.sentAt)}</time></div><div className={`message-bubble${own ? " own" : ""}${message.pending ? " pending" : ""}`}>{message.body}{own && <span className="message-delivery" aria-label={message.pending ? "Отправляется" : "Отправлено"}>{message.pending ? "◷" : "✓"}</span>}</div></div></article>;
             })}</div>)}
-            <div ref={bottomRef} />
           </div>
           <form className="composer" onSubmit={send}><div className="composer-box"><textarea aria-label="Текст сообщения" placeholder="Напишите сообщение…" rows={1} maxLength={4000} value={draft} onChange={(event) => { if (retryMessage.current && event.currentTarget.value.trim() !== retryMessage.current.body) retryMessage.current = null; setDraft(event.currentTarget.value); }} onKeyDown={handleComposerKey} /><div className="composer-meta"><span>Enter — отправить · Shift+Enter — новая строка</span><span>{draft.length}/4000</span></div></div><button className="send-message" type="submit" disabled={!draft.trim() || sending} aria-label="Отправить сообщение"><SendIcon /></button></form>
           <div className="conversation-encryption-note"><span>●</span> Сообщения передаются по защищённому соединению</div>

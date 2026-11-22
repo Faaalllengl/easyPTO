@@ -48,6 +48,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 }
 
 .application { min-height: 100vh; }
+.application.chat-active { height: 100vh; min-height: 0; overflow: hidden; }
 
 .topbar {
   position: sticky;

@@ -1180,7 +1180,7 @@ function App() {
   }, [constructionSnapshot]);
 
   return (
-    <div className="application">
+    <div className={`application${activeModule === "chat" ? " chat-active" : ""}`}>
       <header className="topbar">
         <a className="brand" href="#workspace" aria-label="easyPTO — рабочая область">
           <img className="brand-logo" src={theme === "dark" ? easyPtoLogoDark : easyPtoLogo} alt="" />

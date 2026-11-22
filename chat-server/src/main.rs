@@ -62,6 +62,7 @@ struct LoginResponse { token: String, user: User, unread_count: i64 }
 struct SendMessageRequest { body: String, client_message_id: String }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReadRequest { last_read_message_id: i64 }
 
 #[derive(Deserialize)]
