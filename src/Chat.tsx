@@ -108,10 +108,15 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
     ]).then(([me, history]) => {
       if (!alive) return;
       setUser(me.user);
-      setUnread(me.unreadCount);
-      onUnreadChange(me.unreadCount);
+      const unreadCount = active ? 0 : me.unreadCount;
+      setUnread(unreadCount);
+      onUnreadChange(unreadCount);
       setMessages(history.messages);
       setHasMore(history.hasMore);
+      if (active) {
+        const latestId = Math.max(...history.messages.map((message) => message.id), 0);
+        if (latestId > 0) void request<void>("/read", token, { lastReadMessageId: latestId }).catch(() => undefined);
+      }
       request<HistoryResponse>("/messages?limit=1", token).then((latest) => {
         if (!alive || latest.messages.length === 0) return;
         bottomRef.current?.scrollIntoView({ behavior: "instant", block: "end" });
@@ -125,7 +130,7 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
       }
     }).finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [token, onUnreadChange]);
+  }, [token, active, onUnreadChange]);
 
   useEffect(() => {
     if (!token || !user) return;
@@ -136,10 +141,8 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
 
     const syncLatest = async () => {
       try {
-        const [history, me] = await Promise.all([
-          request<HistoryResponse>("/messages?limit=60", token),
-          request<MeResponse>("/auth/me", token),
-        ]);
+        const history = await request<HistoryResponse>("/messages?limit=60", token);
+        const me = active ? null : await request<MeResponse>("/auth/me", token);
         if (!alive) return;
         setMessages((current) => {
           const previousIds = new Set(current.map((message) => message.id));
@@ -154,8 +157,15 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
           }
           return mergeMessages(current, history.messages);
         });
-        setUnread(me.unreadCount);
-        onUnreadChange(me.unreadCount);
+        if (active) {
+          const latestId = Math.max(...history.messages.map((message) => message.id), 0);
+          setUnread(0);
+          onUnreadChange(0);
+          if (latestId > 0) void request<void>("/read", token, { lastReadMessageId: latestId }).catch(() => undefined);
+        } else if (me) {
+          setUnread(me.unreadCount);
+          onUnreadChange(me.unreadCount);
+        }
         setHasMore(history.hasMore);
       } catch {
         if (alive) setConnected(false);
@@ -218,8 +228,9 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
       const result = await request<LoginResponse>("/auth/login", undefined, { username: username.trim(), password });
       await invoke("chat_store_session_token", { token: result.token });
       setUser(result.user);
-      setUnread(result.unreadCount);
-      onUnreadChange(result.unreadCount);
+      const unreadCount = active ? 0 : result.unreadCount;
+      setUnread(unreadCount);
+      onUnreadChange(unreadCount);
       setPassword("");
       setToken(result.token);
     } catch (reason) {
