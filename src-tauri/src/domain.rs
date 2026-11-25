@@ -334,3 +334,35 @@ pub struct ConstructionLineInput {
     pub planned_amount: f64,
     pub sort_order: i64,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsphaltSegment {
+    pub id: String,
+    pub from_centi_pk: CentiPk,
+    pub to_centi_pk: CentiPk,
+    pub width_m: f64,
+    pub thickness_cm: f64,
+    pub volume_m3: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsphaltSnapshot {
+    pub project: ProjectListItem,
+    pub route_length_m: u64,
+    pub covered_length_m: u64,
+    pub remaining_length_m: u64,
+    pub progress_percent: f64,
+    pub total_volume_m3: f64,
+    pub segments: Vec<AsphaltSegment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsphaltSegmentInput {
+    pub from_pk: String,
+    pub to_pk: String,
+    pub width_m: f64,
+    pub thickness_cm: f64,
+}

@@ -85,7 +85,7 @@ export async function exportExcel(snapshot: ReportSnapshot) {
   layerHeader.font = { bold: true, color: { argb: "FFFFFFFF" } };
   layerHeader.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF315F59" } };
   snapshot.layers.forEach((layer) => summary.addRow([
-    `${layer.code} · ${layer.name}`, km(layer.workAreaLengthCentiPk), km(layer.coveredLengthCentiPk), layer.progressPercent,
+    layer.name, km(layer.workAreaLengthCentiPk), km(layer.coveredLengthCentiPk), layer.progressPercent,
     layer.planPercent, layer.planDate ?? "—", layer.planDeltaPp, km(layer.frontLengthCentiPk),
   ]));
   summary.addRow([]);
@@ -122,7 +122,7 @@ export async function exportExcel(snapshot: ReportSnapshot) {
   snapshot.layers.forEach((layer) => layer.segments.forEach((segment) => {
     const area = snapshot.workAreas.find((item) => item.id === segment.workAreaId);
     segments.addRow({
-      layer: `${layer.code} · ${layer.name}`,
+      layer: layer.name,
       area: area?.name ?? "Рабочая область",
       from: segment.fromCentiPk / 100,
       to: segment.toCentiPk / 100,
@@ -178,13 +178,13 @@ export async function exportWord(snapshot: ReportSnapshot) {
     ]),
     new Paragraph({ text: "План и факт по слоям", heading: HeadingLevel.HEADING_1 }),
     table(["Слой", "Факт, %", "Факт, км", "План, %", "Дата плана", "Δ, п.п.", "Фронт, км"], snapshot.layers.map((layer) => [
-      `${layer.code} · ${layer.name}`, `${layer.progressPercent.toFixed(1).replace(".", ",")}%`, km(layer.coveredLengthCentiPk).toFixed(2).replace(".", ","),
+      layer.name, `${layer.progressPercent.toFixed(1).replace(".", ",")}%`, km(layer.coveredLengthCentiPk).toFixed(2).replace(".", ","),
       layer.planPercent === null ? "—" : `${layer.planPercent.toFixed(1).replace(".", ",")}%`, layer.planDate ?? "—",
       layer.planDeltaPp === null ? "—" : layer.planDeltaPp.toFixed(1).replace(".", ","), km(layer.frontLengthCentiPk).toFixed(2).replace(".", ","),
     ])),
     new Paragraph({ text: "Участки работ", heading: HeadingLevel.HEADING_1 }),
     table(["Слой", "От, ПК", "До, ПК", "Длина, км", "Дата", "Область", "Комментарий"], snapshot.layers.flatMap((layer) => layer.segments.map((segment) => [
-      `${layer.code} · ${layer.name}`, pk(segment.fromCentiPk), pk(segment.toCentiPk), km(segment.toCentiPk - segment.fromCentiPk).toFixed(2).replace(".", ","),
+      layer.name, pk(segment.fromCentiPk), pk(segment.toCentiPk), km(segment.toCentiPk - segment.fromCentiPk).toFixed(2).replace(".", ","),
       segment.workDate, snapshot.workAreas.find((area) => area.id === segment.workAreaId)?.name ?? "—", segment.note ?? "—",
     ]))),
     new Paragraph({ text: "Исключённые диапазоны", heading: HeadingLevel.HEADING_1 }),

@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use keyring::Entry;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, backup::Backup};
 use serde::Serialize;
 use tauri::Manager;
-use keyring::Entry;
 
 pub mod domain;
 mod repository;
@@ -14,11 +14,15 @@ mod repository;
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_app_metadata.sql")),
     (2, include_str!("../migrations/0002_project_domain.sql")),
-    (3, include_str!("../migrations/0003_construction_progress.sql")),
+    (
+        3,
+        include_str!("../migrations/0003_construction_progress.sql"),
+    ),
     (4, include_str!("../migrations/0004_project_address.sql")),
     (5, include_str!("../migrations/0005_construction_units.sql")),
+    (6, include_str!("../migrations/0006_asphalt_segments.sql")),
 ];
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 struct AppState {
     connection: Mutex<Connection>,
@@ -65,7 +69,8 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error>
             connection.pragma_update(None, "foreign_keys", "OFF")?;
         }
         let migration_result = (|| -> Result<(), rusqlite::Error> {
-            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute_batch(sql)?;
             transaction.pragma_update(None, "user_version", target_version)?;
             transaction.commit()
@@ -202,9 +207,9 @@ fn restore_from_backup(
     let version: i64 = source
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version != CURRENT_SCHEMA_VERSION {
+    if version > CURRENT_SCHEMA_VERSION {
         return Err(format!(
-            "Версия схемы копии ({version}) не поддерживается текущей версией приложения"
+            "Версия схемы копии ({version}) новее текущей версии приложения"
         ));
     }
     let integrity: String = source
@@ -237,6 +242,7 @@ fn restore_from_backup(
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| error.to_string())?;
+        migrate(connection).map_err(|error| error.to_string())?;
         repository::record_restore_event(connection)?;
         Ok(())
     })();
@@ -687,7 +693,13 @@ fn update_construction_progress(
         .connection
         .lock()
         .map_err(|_| "Database connection is unavailable".to_string())?;
-    repository::update_construction_progress(&mut connection, &project_id, &line_id, &entry_id, amount)
+    repository::update_construction_progress(
+        &mut connection,
+        &project_id,
+        &line_id,
+        &entry_id,
+        amount,
+    )
 }
 
 #[tauri::command]
@@ -702,6 +714,58 @@ fn delete_construction_progress(
         .lock()
         .map_err(|_| "Database connection is unavailable".to_string())?;
     repository::delete_construction_progress(&mut connection, &project_id, &line_id, &entry_id)
+}
+
+#[tauri::command]
+fn get_asphalt_snapshot(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<domain::AsphaltSnapshot, String> {
+    let connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::load_asphalt_snapshot(&connection, &project_id)
+}
+
+#[tauri::command]
+fn create_asphalt_segment(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    input: domain::AsphaltSegmentInput,
+) -> Result<domain::AsphaltSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::create_asphalt_segment(&mut connection, &project_id, &input)
+}
+
+#[tauri::command]
+fn update_asphalt_segment(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    segment_id: String,
+    input: domain::AsphaltSegmentInput,
+) -> Result<domain::AsphaltSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::update_asphalt_segment(&mut connection, &project_id, &segment_id, &input)
+}
+
+#[tauri::command]
+fn delete_asphalt_segment(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    segment_id: String,
+) -> Result<domain::AsphaltSnapshot, String> {
+    let mut connection = state
+        .connection
+        .lock()
+        .map_err(|_| "Database connection is unavailable".to_string())?;
+    repository::delete_asphalt_segment(&mut connection, &project_id, &segment_id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -754,7 +818,11 @@ pub fn run() {
             rename_construction_line,
             add_construction_progress,
             update_construction_progress,
-            delete_construction_progress
+            delete_construction_progress,
+            get_asphalt_snapshot,
+            create_asphalt_segment,
+            update_asphalt_segment,
+            delete_asphalt_segment
         ])
         .run(tauri::generate_context!())
         .expect("error while running easyPTO");

@@ -5,10 +5,10 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::domain::{
-    BridgeConfigInput, CentiPk, ConstructionLine, ConstructionLineInput,
-    ConstructionProgressEntry, ConstructionSnapshot, Exclusion, ExclusionInput, Interval,
-    LayerInput, LayerSnapshot, ProjectListItem, ProjectSnapshot, ProjectSummary, Segment,
-    SegmentInput, WorkArea, WorkAreaInput, WorkAreaKind,
+    AsphaltSegment, AsphaltSegmentInput, AsphaltSnapshot, BridgeConfigInput, CentiPk,
+    ConstructionLine, ConstructionLineInput, ConstructionProgressEntry, ConstructionSnapshot,
+    Exclusion, ExclusionInput, Interval, LayerInput, LayerSnapshot, ProjectListItem,
+    ProjectSnapshot, ProjectSummary, Segment, SegmentInput, WorkArea, WorkAreaInput, WorkAreaKind,
 };
 
 type Result<T> = std::result::Result<T, String>;
@@ -111,10 +111,257 @@ fn validate_construction_amount(unit: &str, amount: f64, label: &str) -> Result<
     if let Some(digits) = precision {
         let scale = 10_f64.powi(digits);
         if (amount * scale - (amount * scale).round()).abs() > 1e-7 {
-            return Err(format!("{label}: укажите не более {digits} знаков после запятой"));
+            return Err(format!(
+                "{label}: укажите не более {digits} знаков после запятой"
+            ));
         }
     }
     Ok(())
+}
+
+fn validate_asphalt_measure(value: f64, label: &str) -> Result<()> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{label}: укажите число больше нуля"));
+    }
+    if value > 1_000.0 {
+        return Err(format!("{label}: значение превышает допустимый диапазон"));
+    }
+    let scaled = value * 1_000.0;
+    if (scaled - scaled.round()).abs() > 1e-7 {
+        return Err(format!("{label}: укажите не более 3 знаков после запятой"));
+    }
+    Ok(())
+}
+
+fn parse_asphalt_interval(input: &AsphaltSegmentInput) -> Result<(CentiPk, CentiPk)> {
+    let from = CentiPk::parse_pk(&input.from_pk)?;
+    let to = CentiPk::parse_pk(&input.to_pk)?;
+    if to <= from {
+        return Err("Конец отрезка должен быть больше начала".into());
+    }
+    validate_asphalt_measure(input.width_m, "Ширина дороги")?;
+    validate_asphalt_measure(input.thickness_cm, "Толщина слоя")?;
+    Ok((from, to))
+}
+
+fn validate_asphalt_interval_bounds(
+    connection: &Connection,
+    project_id: &str,
+    segment_id: Option<&str>,
+    from: CentiPk,
+    to: CentiPk,
+) -> Result<()> {
+    let (route_start, route_end): (i64, i64) = connection
+        .query_row(
+            "SELECT route_start_centi_pk, route_end_centi_pk FROM projects WHERE id = ?1",
+            [project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Объект не найден".to_string())?;
+    if from.0 < route_start || to.0 > route_end {
+        return Err("Пикетаж отрезка должен находиться в границах дороги".into());
+    }
+    let overlap_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM asphalt_segments
+             WHERE project_id = ?1 AND (?2 IS NULL OR id <> ?2)
+               AND from_centi_pk < ?4 AND to_centi_pk > ?3",
+            params![project_id, segment_id, from.0, to.0],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if overlap_count > 0 {
+        return Err(
+            "Этот отрезок пересекается с уже добавленным. Укажите свободный участок дороги".into(),
+        );
+    }
+    Ok(())
+}
+
+pub fn load_asphalt_snapshot(connection: &Connection, project_id: &str) -> Result<AsphaltSnapshot> {
+    let project = connection
+        .query_row(
+            "SELECT id, name, address, route_start_centi_pk, route_end_centi_pk, updated_at
+             FROM projects WHERE id = ?1",
+            [project_id],
+            |row| {
+                Ok(ProjectListItem {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    address: row.get(2)?,
+                    route_start: CentiPk(row.get(3)?),
+                    route_end: CentiPk(row.get(4)?),
+                    updated_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Объект не найден".to_string())?;
+    let route_length_m = u64::try_from(project.route_end.0 - project.route_start.0)
+        .map_err(|_| "Границы дороги заданы некорректно".to_string())?;
+    let segments = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, from_centi_pk, to_centi_pk, width_m, thickness_cm
+                 FROM asphalt_segments WHERE project_id = ?1
+                 ORDER BY from_centi_pk, to_centi_pk, id",
+            )
+            .map_err(db_error)?;
+        statement
+            .query_map([project_id], |row| {
+                let from_centi_pk = CentiPk(row.get(1)?);
+                let to_centi_pk = CentiPk(row.get(2)?);
+                let width_m: f64 = row.get(3)?;
+                let thickness_cm: f64 = row.get(4)?;
+                let length_m = (to_centi_pk.0 - from_centi_pk.0) as f64;
+                Ok(AsphaltSegment {
+                    id: row.get(0)?,
+                    from_centi_pk,
+                    to_centi_pk,
+                    width_m,
+                    thickness_cm,
+                    volume_m3: length_m * width_m * thickness_cm / 100.0,
+                })
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?
+    };
+    let covered_length_m = segments
+        .iter()
+        .map(|segment| (segment.to_centi_pk.0 - segment.from_centi_pk.0) as u64)
+        .sum::<u64>();
+    let total_volume_m3 = segments.iter().map(|segment| segment.volume_m3).sum();
+    Ok(AsphaltSnapshot {
+        project,
+        route_length_m,
+        covered_length_m,
+        remaining_length_m: route_length_m.saturating_sub(covered_length_m),
+        progress_percent: if route_length_m == 0 {
+            0.0
+        } else {
+            covered_length_m as f64 * 100.0 / route_length_m as f64
+        },
+        total_volume_m3,
+        segments,
+    })
+}
+
+pub fn create_asphalt_segment(
+    connection: &mut Connection,
+    project_id: &str,
+    input: &AsphaltSegmentInput,
+) -> Result<AsphaltSnapshot> {
+    let (from, to) = parse_asphalt_interval(input)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    validate_asphalt_interval_bounds(&transaction, project_id, None, from, to)?;
+    let segment_id = id();
+    let now = timestamp();
+    transaction
+        .execute(
+            "INSERT INTO asphalt_segments (id, project_id, from_centi_pk, to_centi_pk, width_m, thickness_cm, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![segment_id, project_id, from.0, to.0, input.width_m, input.thickness_cm, now],
+        )
+        .map_err(db_error)?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!(
+            "Добавлен асфальтовый участок {}–{} ПК, объём {:.3} м³",
+            from.format_pk(),
+            to.format_pk(),
+            (to.0 - from.0) as f64 * input.width_m * input.thickness_cm / 100.0
+        ),
+    )?;
+    let snapshot = load_asphalt_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn update_asphalt_segment(
+    connection: &mut Connection,
+    project_id: &str,
+    segment_id: &str,
+    input: &AsphaltSegmentInput,
+) -> Result<AsphaltSnapshot> {
+    let (from, to) = parse_asphalt_interval(input)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM asphalt_segments WHERE project_id = ?1 AND id = ?2)",
+            params![project_id, segment_id],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !exists {
+        return Err("Асфальтовый участок не найден".into());
+    }
+    validate_asphalt_interval_bounds(&transaction, project_id, Some(segment_id), from, to)?;
+    transaction
+        .execute(
+            "UPDATE asphalt_segments SET from_centi_pk = ?1, to_centi_pk = ?2, width_m = ?3, thickness_cm = ?4, updated_at = ?5
+             WHERE project_id = ?6 AND id = ?7",
+            params![from.0, to.0, input.width_m, input.thickness_cm, timestamp(), project_id, segment_id],
+        )
+        .map_err(db_error)?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!(
+            "Изменён асфальтовый участок {}–{} ПК, объём {:.3} м³",
+            from.format_pk(),
+            to.format_pk(),
+            (to.0 - from.0) as f64 * input.width_m * input.thickness_cm / 100.0
+        ),
+    )?;
+    let snapshot = load_asphalt_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
+}
+
+pub fn delete_asphalt_segment(
+    connection: &mut Connection,
+    project_id: &str,
+    segment_id: &str,
+) -> Result<AsphaltSnapshot> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let interval = transaction
+        .query_row(
+            "SELECT from_centi_pk, to_centi_pk FROM asphalt_segments WHERE project_id = ?1 AND id = ?2",
+            params![project_id, segment_id],
+            |row| Ok((CentiPk(row.get(0)?), CentiPk(row.get(1)?))),
+        )
+        .optional()
+        .map_err(db_error)?
+        .ok_or_else(|| "Асфальтовый участок не найден".to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM asphalt_segments WHERE project_id = ?1 AND id = ?2",
+            params![project_id, segment_id],
+        )
+        .map_err(db_error)?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!(
+            "Удалён асфальтовый участок {}–{} ПК",
+            interval.0.format_pk(),
+            interval.1.format_pk()
+        ),
+    )?;
+    let snapshot = load_asphalt_snapshot(&transaction, project_id)?;
+    transaction.commit().map_err(db_error)?;
+    Ok(snapshot)
 }
 
 pub fn load_construction_snapshot(
@@ -223,7 +470,16 @@ pub fn create_construction_line(
     if name.is_empty() {
         return Err("Укажите название линии данных".into());
     }
-    if !matches!(input.unit.as_str(), "pieces" | "meters" | "kilometers" | "square_meters" | "cubic_meters" | "kilograms" | "tonnes") {
+    if !matches!(
+        input.unit.as_str(),
+        "pieces"
+            | "meters"
+            | "kilometers"
+            | "square_meters"
+            | "cubic_meters"
+            | "kilograms"
+            | "tonnes"
+    ) {
         return Err("Выберите единицу измерения из списка".into());
     }
     validate_construction_amount(&input.unit, input.planned_amount, "Проектный объём")?;
@@ -235,7 +491,11 @@ pub fn create_construction_line(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
     let exists: bool = transaction
-        .query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)", [project_id], |row| row.get(0))
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |row| row.get(0),
+        )
         .map_err(db_error)?;
     if !exists {
         return Err("Объект не найден".into());
@@ -248,7 +508,11 @@ pub fn create_construction_line(
             params![id(), project_id, name, input.unit, input.planned_amount, input.sort_order, now],
         )
         .map_err(db_error)?;
-    touch_project(&transaction, project_id, &format!("Добавлена линия строительства «{name}»"))?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!("Добавлена линия строительства «{name}»"),
+    )?;
     let snapshot = load_construction_snapshot(&transaction, project_id)?;
     transaction.commit().map_err(db_error)?;
     Ok(snapshot)
@@ -272,9 +536,16 @@ pub fn delete_construction_line(
         .map_err(db_error)?
         .ok_or_else(|| "Линия данных не найдена".to_string())?;
     transaction
-        .execute("DELETE FROM construction_lines WHERE project_id = ?1 AND id = ?2", params![project_id, line_id])
+        .execute(
+            "DELETE FROM construction_lines WHERE project_id = ?1 AND id = ?2",
+            params![project_id, line_id],
+        )
         .map_err(db_error)?;
-    touch_project(&transaction, project_id, &format!("Удалена линия строительства «{name}»"))?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!("Удалена линия строительства «{name}»"),
+    )?;
     let snapshot = load_construction_snapshot(&transaction, project_id)?;
     transaction.commit().map_err(db_error)?;
     Ok(snapshot)
@@ -442,7 +713,11 @@ pub fn add_construction_progress(
             params![happened_at, project_id, line_id],
         )
         .map_err(db_error)?;
-    touch_project(&transaction, project_id, &format!("Добавлена запись выполнения «{name}»: {amount} {unit}"))?;
+    touch_project(
+        &transaction,
+        project_id,
+        &format!("Добавлена запись выполнения «{name}»: {amount} {unit}"),
+    )?;
     let snapshot = load_construction_snapshot(&transaction, project_id)?;
     transaction.commit().map_err(db_error)?;
     Ok(snapshot)
@@ -559,22 +834,37 @@ pub fn delete_project(
         .execute("DELETE FROM segments WHERE project_id = ?1", [project_id])
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM layer_work_areas WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM layer_work_areas WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM exclusion_intervals WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM exclusion_intervals WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM exclusion_layers WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM exclusion_layers WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM exclusion_work_areas WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM exclusion_work_areas WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
         .execute("DELETE FROM exclusions WHERE project_id = ?1", [project_id])
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM work_area_intervals WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM work_area_intervals WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
         .execute(
@@ -583,10 +873,22 @@ pub fn delete_project(
         )
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM construction_lines WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM construction_lines WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
-        .execute("DELETE FROM journal_events WHERE project_id = ?1", [project_id])
+        .execute(
+            "DELETE FROM asphalt_segments WHERE project_id = ?1",
+            [project_id],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "DELETE FROM journal_events WHERE project_id = ?1",
+            [project_id],
+        )
         .map_err(db_error)?;
     transaction
         .execute(
@@ -1548,6 +1850,153 @@ pub fn delete_custom_work_area(
     Ok(snapshot)
 }
 
+#[cfg(test)]
+mod asphalt_tests {
+    use super::*;
+
+    fn database() -> (Connection, String) {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign keys");
+        crate::migrate(&mut connection).expect("apply database migrations");
+        let project = create_project(&mut connection, "Тестовая дорога", "1,00", "11,00")
+            .expect("create test project");
+        (connection, project.project.id)
+    }
+
+    fn segment(from_pk: &str, to_pk: &str, width_m: f64, thickness_cm: f64) -> AsphaltSegmentInput {
+        AsphaltSegmentInput {
+            from_pk: from_pk.into(),
+            to_pk: to_pk.into(),
+            width_m,
+            thickness_cm,
+        }
+    }
+
+    #[test]
+    fn asphalt_crud_calculates_volume_and_rejects_invalid_intervals() {
+        let (mut connection, project_id) = database();
+        let first = create_asphalt_segment(
+            &mut connection,
+            &project_id,
+            &segment("1,00", "2,00", 7.5, 5.0),
+        )
+        .expect("create first asphalt section");
+        assert_eq!(first.route_length_m, 1_000);
+        assert_eq!(first.covered_length_m, 100);
+        assert!((first.total_volume_m3 - 37.5).abs() < 1e-9);
+
+        let adjacent = create_asphalt_segment(
+            &mut connection,
+            &project_id,
+            &segment("2,00", "3,00", 8.0, 4.5),
+        )
+        .expect("allow adjacent asphalt sections");
+        assert_eq!(adjacent.covered_length_m, 200);
+
+        assert!(
+            create_asphalt_segment(
+                &mut connection,
+                &project_id,
+                &segment("1,50", "2,10", 7.0, 5.0),
+            )
+            .expect_err("reject overlapping section")
+            .contains("пересекается")
+        );
+        assert!(
+            create_asphalt_segment(
+                &mut connection,
+                &project_id,
+                &segment("0,90", "1,10", 7.0, 5.0),
+            )
+            .expect_err("reject section outside the route")
+            .contains("границах")
+        );
+        assert!(
+            create_asphalt_segment(
+                &mut connection,
+                &project_id,
+                &segment("3,00", "3,00", 7.0, 5.0),
+            )
+            .is_err()
+        );
+        assert!(
+            create_asphalt_segment(
+                &mut connection,
+                &project_id,
+                &segment("3,00", "4,00", 0.0, 5.0),
+            )
+            .is_err()
+        );
+
+        let updated = update_asphalt_segment(
+            &mut connection,
+            &project_id,
+            &first.segments[0].id,
+            &segment("1,00", "2,00", 8.0, 6.0),
+        )
+        .expect("allow updating a segment without treating itself as overlap");
+        assert!((updated.segments[0].volume_m3 - 48.0).abs() < 1e-9);
+        assert!((updated.total_volume_m3 - 84.0).abs() < 1e-9);
+
+        let deleted = delete_asphalt_segment(&mut connection, &project_id, &first.segments[0].id)
+            .expect("delete asphalt segment");
+        assert_eq!(deleted.segments.len(), 1);
+        assert_eq!(deleted.covered_length_m, 100);
+    }
+
+    #[test]
+    fn asphalt_measure_validation_rejects_non_finite_and_excess_precision() {
+        assert!(validate_asphalt_measure(f64::NAN, "Ширина").is_err());
+        assert!(validate_asphalt_measure(0.0, "Ширина").is_err());
+        assert!(validate_asphalt_measure(7.1234, "Ширина").is_err());
+        assert!(validate_asphalt_measure(7.125, "Ширина").is_ok());
+    }
+
+    #[test]
+    fn asphalt_migration_preserves_existing_projects() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign keys");
+        for &(version, sql) in crate::MIGRATIONS.iter().take(5) {
+            let rebuild_construction_lines = version == 5;
+            if rebuild_construction_lines {
+                connection
+                    .pragma_update(None, "foreign_keys", "OFF")
+                    .expect("disable foreign keys for existing migration");
+            }
+            connection
+                .execute_batch(sql)
+                .expect("apply prior migration");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("record prior schema version");
+            if rebuild_construction_lines {
+                connection
+                    .pragma_update(None, "foreign_keys", "ON")
+                    .expect("enable foreign keys after existing migration");
+            }
+        }
+        let project = create_project(&mut connection, "Существующий объект", "2,00", "4,00")
+            .expect("create project in schema version 5");
+        crate::migrate(&mut connection).expect("upgrade existing database");
+        let project_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+            .expect("read preserved project count");
+        assert_eq!(project_count, 1);
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read upgraded schema version");
+        assert_eq!(version, 6);
+        let snapshot = load_asphalt_snapshot(&connection, &project.project.id)
+            .expect("load asphalt data for existing project");
+        assert_eq!(snapshot.route_length_m, 200);
+        assert!(snapshot.segments.is_empty());
+    }
+}
+
 fn assign_layer_bases_by_order(connection: &Connection, project_id: &str) -> Result<()> {
     let mut statement = connection
         .prepare("SELECT id FROM layers WHERE project_id = ?1 ORDER BY sort_order, id")
@@ -1714,7 +2163,11 @@ pub fn reorder_layers(
             )
             .map_err(db_error)?;
     }
-    touch_project(&transaction, project_id, "Изменён порядок слоёв и переназначены базовые слои")?;
+    touch_project(
+        &transaction,
+        project_id,
+        "Изменён порядок слоёв и переназначены базовые слои",
+    )?;
     let snapshot = load_snapshot(&transaction, project_id)?;
     transaction.commit().map_err(db_error)?;
     Ok(snapshot)

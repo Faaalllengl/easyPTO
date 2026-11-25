@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -85,7 +85,11 @@ type ConstructionLine = {
 };
 type ConstructionSnapshot = { project: ProjectListItem; lines: ConstructionLine[]; progressPercent: number };
 type ConstructionLineForm = { name: string; unit: ConstructionUnit; plannedAmount: string };
-type ActiveModule = "layers" | "construction" | "chat" | "settings";
+type AsphaltSegment = { id: string; fromCentiPk: number; toCentiPk: number; widthM: number; thicknessCm: number; volumeM3: number };
+type AsphaltSnapshot = { project: ProjectListItem; routeLengthM: number; coveredLengthM: number; remainingLengthM: number; progressPercent: number; totalVolumeM3: number; segments: AsphaltSegment[] };
+type AsphaltSegmentForm = { fromPk: string; toPk: string; widthM: string; thicknessCm: string };
+type ActiveModule = "layers" | "construction" | "asphalt" | "chat" | "settings";
+const emptyAsphaltSegmentForm = (): AsphaltSegmentForm => ({ fromPk: "", toPk: "", widthM: "", thicknessCm: "" });
 const getStartupModule = (): "layers" | "construction" => {
   try {
     return localStorage.getItem("easypto.startModule") === "construction" ? "construction" : "layers";
@@ -155,11 +159,12 @@ const unitMeta = (unit: ConstructionUnit) => constructionUnits[unit];
 const formatDate = (value: string | null) => value ? new Intl.DateTimeFormat("ru-RU").format(new Date(`${value}T00:00:00`)) : "";
 const formatTimestamp = (value: string) => value ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "short", timeStyle: "short" }).format(new Date(value)) : "Дата неизвестна";
 const asCentiPk = (value: string): number | null => {
-  const match = value.trim().match(/^(\d+)(?:[,.](\d{0,2}))?$/);
+  const match = value.trim().match(/^(-?\d+)(?:[,.](\d{0,2}))?$/);
   if (!match) return null;
-  const whole = Number(match[1]);
+  const negative = match[1].startsWith("-");
+  const whole = Number(negative ? match[1].slice(1) : match[1]);
   const fraction = (match[2] ?? "").padEnd(2, "0");
-  const result = whole * 100 + Number(fraction || "0");
+  const result = (whole * 100 + Number(fraction || "0")) * (negative ? -1 : 1);
   return Number.isSafeInteger(result) ? result : null;
 };
 const markerPosition = (value: string, project: ProjectListItem | null) => {
@@ -214,14 +219,36 @@ function App() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [snapshot, setSnapshot] = useState<ProjectSnapshot | null>(null);
   const [constructionSnapshot, setConstructionSnapshot] = useState<ConstructionSnapshot | null>(null);
+  const [asphaltSnapshot, setAsphaltSnapshot] = useState<AsphaltSnapshot | null>(null);
   const [activeModule, setActiveModule] = useState<ActiveModule>(getStartupModule);
+  const chatReturnScrollTop = useRef(0);
   const [chatUnread, setChatUnread] = useState(0);
   const updateChatUnread = useCallback((count: number) => setChatUnread(count), []);
+  useLayoutEffect(() => {
+    if (activeModule !== "chat") return;
+
+    const root = document.documentElement;
+    const previousRootOverflow = root.style.overflow;
+    const previousBodyOverflow = document.body.style.overflow;
+    root.style.overflow = "hidden";
+    document.body.style.overflow = "hidden";
+
+    return () => {
+      root.style.overflow = previousRootOverflow;
+      document.body.style.overflow = previousBodyOverflow;
+      window.scrollTo(0, chatReturnScrollTop.current);
+    };
+  }, [activeModule]);
   const [startupModule, setStartupModule] = useState<"layers" | "construction">(getStartupModule);
   const [theme, setTheme] = useState<"light" | "dark">(getSavedTheme);
   const [applicationVersion, setApplicationVersion] = useState("—");
   const [constructionLoading, setConstructionLoading] = useState(false);
   const [constructionLoadAttempt, setConstructionLoadAttempt] = useState(0);
+  const [asphaltLoading, setAsphaltLoading] = useState(false);
+  const [asphaltLoadAttempt, setAsphaltLoadAttempt] = useState(0);
+  const [asphaltEditorOpen, setAsphaltEditorOpen] = useState(false);
+  const [editingAsphaltSegmentId, setEditingAsphaltSegmentId] = useState<string | null>(null);
+  const [asphaltSegmentForm, setAsphaltSegmentForm] = useState<AsphaltSegmentForm>(emptyAsphaltSegmentForm);
   const [constructionLineEditorOpen, setConstructionLineEditorOpen] = useState(false);
   const [constructionLineForm, setConstructionLineForm] = useState<ConstructionLineForm>({ name: "", unit: "meters", plannedAmount: "" });
   const [activeConstructionLineId, setActiveConstructionLineId] = useState<string | null>(null);
@@ -274,6 +301,7 @@ function App() {
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [checkingForUpdates, setCheckingForUpdates] = useState(false);
+  const [updateCheckMessage, setUpdateCheckMessage] = useState<{ text: string; isError?: boolean } | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
   const refreshProjects = async () => {
@@ -461,6 +489,11 @@ function App() {
   }, [theme]);
 
   const selectModule = (module: ActiveModule) => {
+    if (module === "chat") {
+      if (activeModule !== "chat") chatReturnScrollTop.current = window.scrollY;
+      window.scrollTo(0, 0);
+      document.querySelector<HTMLElement>(".sidebar")?.scrollTo(0, 0);
+    }
     setActiveModule(module);
   };
 
@@ -475,17 +508,20 @@ function App() {
 
   const checkForUpdates = async () => {
     if (!isTauri()) {
-      setNotice("Проверка обновлений доступна в установленной версии приложения.");
+      setUpdateCheckMessage({ text: "Проверка доступна в установленной версии приложения.", isError: true });
       return;
     }
     setCheckingForUpdates(true);
+    setUpdateCheckMessage(null);
     setUpdateError(null);
     try {
       const update = await check();
-      if (update) setAvailableUpdate(update);
-      else setNotice("Установлена последняя версия easyPTO.");
+      if (update) {
+        setAvailableUpdate(update);
+        setUpdateCheckMessage({ text: `Доступна версия ${update.version}.` });
+      } else setUpdateCheckMessage({ text: "Установлена последняя версия easyPTO." });
     } catch (reason) {
-      setUpdateError(reason instanceof Error ? reason.message : String(reason));
+      setUpdateCheckMessage({ text: `Не удалось проверить: ${reason instanceof Error ? reason.message : String(reason)}`, isError: true });
     } finally {
       setCheckingForUpdates(false);
     }
@@ -533,7 +569,7 @@ function App() {
   }, [selectedProjectId]);
 
   useEffect(() => {
-    if (activeModule !== "construction" || !selectedProjectId) {
+    if (!selectedProjectId) {
       setConstructionSnapshot(null);
       setConstructionLoading(false);
       return;
@@ -555,7 +591,88 @@ function App() {
       })
       .finally(() => { if (alive) setConstructionLoading(false); });
     return () => { alive = false; };
-  }, [activeModule, selectedProjectId, constructionLoadAttempt]);
+  }, [selectedProjectId, constructionLoadAttempt]);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setAsphaltSnapshot(null);
+      setAsphaltLoading(false);
+      return;
+    }
+    let alive = true;
+    setAsphaltLoading(true);
+    setAsphaltSnapshot(null);
+    setEditingAsphaltSegmentId(null);
+    setAsphaltEditorOpen(false);
+    setAsphaltSegmentForm(emptyAsphaltSegmentForm());
+    setError(null);
+    invoke<AsphaltSnapshot>("get_asphalt_snapshot", { projectId: selectedProjectId })
+      .then((result) => { if (alive) setAsphaltSnapshot(result); })
+      .catch((reason: unknown) => { if (alive) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (alive) setAsphaltLoading(false); });
+    return () => { alive = false; };
+  }, [selectedProjectId, asphaltLoadAttempt]);
+
+  const saveAsphaltSegment = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProjectId || !asphaltSnapshot) return;
+    const editing = editingAsphaltSegmentId !== null;
+    const widthM = Number(asphaltSegmentForm.widthM.trim().replace(",", "."));
+    const thicknessCm = Number(asphaltSegmentForm.thicknessCm.trim().replace(",", "."));
+    const from = asCentiPk(asphaltSegmentForm.fromPk);
+    const to = asCentiPk(asphaltSegmentForm.toPk);
+    if (from === null || to === null || to <= from) {
+      setError("Укажите корректные пикеты: конец отрезка должен быть больше начала.");
+      return;
+    }
+    if (!Number.isFinite(widthM) || widthM <= 0 || !Number.isFinite(thicknessCm) || thicknessCm <= 0) {
+      setError("Ширина и толщина должны быть больше нуля.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const input = { fromPk: asphaltSegmentForm.fromPk, toPk: asphaltSegmentForm.toPk, widthM, thicknessCm };
+      const updated = editing
+        ? await invoke<AsphaltSnapshot>("update_asphalt_segment", { projectId: selectedProjectId, segmentId: editingAsphaltSegmentId, input })
+        : await invoke<AsphaltSnapshot>("create_asphalt_segment", { projectId: selectedProjectId, input });
+      setAsphaltSnapshot(updated);
+      setAsphaltEditorOpen(false);
+      setEditingAsphaltSegmentId(null);
+      setAsphaltSegmentForm(emptyAsphaltSegmentForm());
+      setNotice(editing ? "Асфальтовый участок изменён." : "Асфальтовый участок добавлен.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const editAsphaltSegment = (segment: AsphaltSegment) => {
+    setEditingAsphaltSegmentId(segment.id);
+    setAsphaltSegmentForm({
+      fromPk: formatPk(segment.fromCentiPk),
+      toPk: formatPk(segment.toCentiPk),
+      widthM: String(segment.widthM).replace(".", ","),
+      thicknessCm: String(segment.thicknessCm).replace(".", ","),
+    });
+    setAsphaltEditorOpen(true);
+  };
+
+  const removeAsphaltSegment = async (segment: AsphaltSegment) => {
+    if (!selectedProjectId || !window.confirm(`Удалить участок ${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК?`)) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<AsphaltSnapshot>("delete_asphalt_segment", { projectId: selectedProjectId, segmentId: segment.id });
+      setAsphaltSnapshot(updated);
+      setNotice("Асфальтовый участок удалён.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (activeModule !== "construction" || !constructionSnapshot || constructionGuideAutoShown) return;
@@ -1181,6 +1298,7 @@ function App() {
 
   return (
     <div className={`application${activeModule === "chat" ? " chat-active" : ""}`}>
+      <a className="skip-link" href="#main-content">Перейти к содержимому</a>
       <header className="topbar">
         <a className="brand" href="#workspace" aria-label="easyPTO — рабочая область">
           <img className="brand-logo" src={theme === "dark" ? easyPtoLogoDark : easyPtoLogo} alt="" />
@@ -1194,7 +1312,7 @@ function App() {
           </select>
         </label>
         <button className="new-project-button" type="button" onClick={() => setProjectDialogOpen(true)} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
-        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать раздел</span><select aria-label="Выбрать раздел" value={activeModule} onChange={(event) => selectModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option><option value="chat">Чат{chatUnread ? ` · ${chatUnread}` : ""}</option><option value="settings">Настройки</option></select></label>
+        <label className="mobile-module-switch"><span className="visually-hidden">Выбрать раздел</span><select aria-label="Выбрать раздел" value={activeModule} onChange={(event) => selectModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option><option value="asphalt">Асфальт</option><option value="chat">Чат{chatUnread ? ` · ${chatUnread}` : ""}</option><option value="settings">Настройки</option></select></label>
         <div className="topbar-spacer" />
         <div className={`save-state${saving ? " is-saving" : ""}${error ? " is-error" : ""}`} aria-live="polite">
           <span className="save-dot" />
@@ -1210,15 +1328,16 @@ function App() {
       <div className="workspace" id="workspace">
         <aside className="sidebar" aria-label="Разделы приложения">
           <div className="sidebar-caption">РАБОЧЕЕ МЕСТО</div>
-          <button className={`nav-item${activeModule === "layers" ? " active" : ""}`} type="button" aria-current={activeModule === "layers" ? "page" : undefined} onClick={() => selectModule("layers")} title="Слои дорожной одежды"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></button>
-          <button className={`nav-item construction-nav-item${activeModule === "construction" ? " active" : ""}`} type="button" aria-current={activeModule === "construction" ? "page" : undefined} onClick={() => selectModule("construction")} title="Строительство автомобильной дороги"><ConstructionIcon /><span>Строительство автомобильной дороги</span><span className="nav-count">{constructionSnapshot?.lines.length ?? 0}</span></button>
+          <button className={`nav-item${activeModule === "layers" ? " active" : ""}`} type="button" aria-label={`Слои дорожной одежды — всего: ${snapshot?.layers.length ?? 0}`} aria-current={activeModule === "layers" ? "page" : undefined} onClick={() => selectModule("layers")} title="Слои дорожной одежды"><RoadIcon /><span>Слои</span><span className="nav-count">{snapshot?.layers.length ?? 0}</span></button>
+          <button className={`nav-item construction-nav-item${activeModule === "construction" ? " active" : ""}`} type="button" aria-label={`Строительство автомобильной дороги — записей: ${constructionSnapshot?.project.id === selectedProjectId ? constructionSnapshot.lines.length : 0}`} aria-current={activeModule === "construction" ? "page" : undefined} onClick={() => selectModule("construction")} title="Строительство автомобильной дороги"><ConstructionIcon /><span>Строительство автомобильной дороги</span><span className="nav-count">{constructionSnapshot?.project.id === selectedProjectId ? constructionSnapshot.lines.length : 0}</span></button>
+          <button className={`nav-item${activeModule === "asphalt" ? " active" : ""}`} type="button" aria-label={`Асфальт — отрезков всего: ${asphaltSnapshot?.project.id === selectedProjectId ? asphaltSnapshot.segments.length : 0}`} aria-current={activeModule === "asphalt" ? "page" : undefined} onClick={() => selectModule("asphalt")} title="Расчёт уложенного асфальта"><AsphaltIcon /><span>Асфальт</span><span className="nav-count">{asphaltSnapshot?.project.id === selectedProjectId ? asphaltSnapshot.segments.length : 0}</span></button>
           <button className={`nav-item${activeModule === "chat" ? " active" : ""}`} type="button" aria-current={activeModule === "chat" ? "page" : undefined} onClick={() => selectModule("chat")} title="Чат"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 11.6a7.9 7.9 0 0 1-8.1 7.8 8.5 8.5 0 0 1-3.3-.7L4 20l1.2-4.1a7.5 7.5 0 0 1-1.1-4.1A7.9 7.9 0 0 1 12.2 4a7.9 7.9 0 0 1 8 7.6Z" /><path d="M8 11.8h8M8 14.8h5" /></svg><span>Чат</span>{chatUnread > 0 && <span className="nav-count chat-nav-count">{chatUnread > 99 ? "99+" : chatUnread}</span>}</button>
           <div className="sidebar-caption settings-caption">ПРИЛОЖЕНИЕ</div>
           <button className={`nav-item settings-nav-item${activeModule === "settings" ? " active" : ""}`} type="button" aria-current={activeModule === "settings" ? "page" : undefined} onClick={() => selectModule("settings")} title="Настройки"><SettingsIcon /><span>Настройки</span></button>
           <div className="sidebar-bottom"><span className="local-indicator" /><span>Проекты локально</span></div>
         </aside>
 
-        <main className="main-content">
+        <main className="main-content" id="main-content" tabIndex={-1}>
           {activeModule === "settings" ? <>
             <div className="page-heading settings-page-heading"><div><div className="breadcrumb"><span>easyPTO</span><span className="crumb-separator">/</span><strong>Приложение</strong></div><h1>Настройки</h1><p>Параметры работы и данные easyPTO на этом устройстве.</p></div></div>
             {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
@@ -1240,7 +1359,7 @@ function App() {
             <section className="settings-section" aria-labelledby="settings-app-title">
               <div className="settings-section-heading"><h2 id="settings-app-title">О приложении</h2><p>Версия и обновления easyPTO.</p></div>
               <div className="settings-row"><span><strong>Версия приложения</strong><small>easyPTO для рабочего стола</small></span><span className="settings-version">{applicationVersion}</span></div>
-              <div className="settings-row"><span><strong>Обновления</strong><small>{updateError ? `Не удалось проверить: ${updateError}` : "Проверяйте обновления вручную или дождитесь автоматической проверки при запуске."}</small></span><div className="update-check-action"><button className="quiet-button" type="button" onClick={() => void checkForUpdates()} disabled={checkingForUpdates || installingUpdate}>Проверить обновления</button><span className={`update-check-status${checkingForUpdates ? " is-checking" : ""}`} aria-live="polite" aria-atomic="true">{checkingForUpdates && <><i className="update-spinner" aria-hidden="true" />Проверяем…</>}</span></div></div>
+              <div className="settings-row"><span><strong>Обновления</strong><small>Проверяйте обновления вручную или дождитесь автоматической проверки при запуске.</small></span><div className="update-check-action"><button className="quiet-button" type="button" onClick={() => void checkForUpdates()} disabled={checkingForUpdates || installingUpdate}>Проверить обновления</button><span className={`update-check-status${checkingForUpdates ? " is-checking" : ""}${updateCheckMessage?.isError ? " is-error" : ""}`} aria-live="polite" aria-atomic="true">{checkingForUpdates ? <><i className="update-spinner" aria-hidden="true" />Проверяем…</> : updateCheckMessage?.text}</span></div></div>
             </section>
           </> : loading && !snapshot ? <LoadingState /> : !snapshot ? (
             <EmptyProjectState error={error} onCreate={() => setProjectDialogOpen(true)} />
@@ -1320,6 +1439,74 @@ function App() {
                   })}</div> : !constructionLineEditorOpen && <div className="construction-empty"><span className="empty-icon"><ConstructionIcon /></span><strong>Линий данных пока нет</strong><span>Создайте линию и укажите проектное количество или протяжённость.</span><button className="quiet-button" type="button" onClick={() => setConstructionLineEditorOpen(true)}><PlusIcon /> Добавить первую линию</button></div>}
                 </section>
                 <div className="workspace-footnote"><span>easyPTO <b>·</b> строительство автомобильной дороги</span><span>{databaseStatus ? `Схема базы данных ${databaseStatus.schemaVersion}` : "Локальное хранилище"}</span></div>
+              </>
+            ) : activeModule === "asphalt" ? (
+              asphaltLoading ? <LoadingState /> : !asphaltSnapshot ? <>
+                {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
+                <div className="construction-load-error"><span>Не удалось загрузить данные об асфальте.</span><button className="quiet-button" type="button" onClick={() => setAsphaltLoadAttempt((attempt) => attempt + 1)}>Повторить</button></div>
+              </> : <>
+                <div className="page-heading construction-page-heading asphalt-page-heading">
+                  <div>
+                    <div className="breadcrumb"><span>{asphaltSnapshot.project.name}</span><span className="crumb-separator">/</span><strong>Асфальт</strong></div>
+                    <h1>Уложенное асфальтовое покрытие</h1>
+                    <p>Укажите пикетаж и параметры каждого выполненного отрезка.</p>
+                  </div>
+                  <div className="page-heading-actions">
+                    {!asphaltEditorOpen && <button className="compact-button active-action" type="button" onClick={() => { setAsphaltSegmentForm(emptyAsphaltSegmentForm()); setEditingAsphaltSegmentId(null); setAsphaltEditorOpen(true); }} disabled={saving}><PlusIcon /> Добавить отрезок</button>}
+                    <button className="quiet-button" type="button" onClick={openHistory}>История и копии</button>
+                    <details className="project-actions"><summary aria-label="Действия с объектом">•••</summary><div><button type="button" onClick={renameSelectedProject}>Переименовать объект</button><button type="button" onClick={removeSelectedProject} disabled={projects.length <= 1}>Удалить объект</button></div></details>
+                  </div>
+                </div>
+
+                {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}<button type="button" onClick={() => setError(null)} aria-label="Закрыть сообщение">×</button></div>}
+                {notice && <div className="inline-message success-message" role="status"><CheckIcon />{notice}<button type="button" onClick={() => setNotice(null)} aria-label="Закрыть сообщение">×</button></div>}
+
+                <section className="asphalt-overview" aria-label="Прогресс укладки асфальта">
+                  <div className="asphalt-overview-top">
+                    <div><span className="field-label">МАРШРУТ ОБЪЕКТА</span><strong className="mono">ПК {formatPk(asphaltSnapshot.project.routeStart)} <span aria-hidden="true">→</span> ПК {formatPk(asphaltSnapshot.project.routeEnd)}</strong></div>
+                    <div><span className="field-label">ДЛИНА ДОРОГИ</span><strong className="mono">{formatNumber(asphaltSnapshot.routeLengthM / 1000, 3)} <small>км</small></strong></div>
+                  </div>
+                  <div className="asphalt-stats">
+                    <div><span>Уложено</span><strong className="mono">{formatNumber(asphaltSnapshot.coveredLengthM, 0)} <small>м</small></strong></div>
+                    <div><span>Осталось</span><strong className="mono">{formatNumber(asphaltSnapshot.remainingLengthM, 0)} <small>м</small></strong></div>
+                    <div><span>Покрытие</span><strong className="mono">{roundedPercent(asphaltSnapshot.progressPercent)}<small>%</small></strong></div>
+                    <div className="asphalt-total-volume"><span>Уложено асфальта</span><strong className="mono">{formatNumber(asphaltSnapshot.totalVolumeM3, 3)} <small>м³</small></strong></div>
+                  </div>
+                  <div className="asphalt-track-wrap">
+                    <div className="asphalt-track-labels mono"><span>ПК {formatPk(asphaltSnapshot.project.routeStart)}</span><span>ПК {formatPk(asphaltSnapshot.project.routeEnd)}</span></div>
+                    <div className="asphalt-track" role="img" aria-label={`Уложено ${formatNumber(asphaltSnapshot.coveredLengthM, 0)} метров из ${formatNumber(asphaltSnapshot.routeLengthM, 0)} метров`}>
+                      <span className="asphalt-track-centerline" />
+                      {asphaltSnapshot.segments.map((segment, index) => {
+                        const startPercent = ((segment.fromCentiPk - asphaltSnapshot.project.routeStart) / asphaltSnapshot.routeLengthM) * 100;
+                        const widthPercent = ((segment.toCentiPk - segment.fromCentiPk) / asphaltSnapshot.routeLengthM) * 100;
+                        return <i key={segment.id} title={`${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК · ${formatNumber(segment.volumeM3, 3)} м³`} style={{ left: `${startPercent}%`, width: `${widthPercent}%` }}><span>{index + 1}</span></i>;
+                      })}
+                    </div>
+                    <div className="asphalt-track-caption"><span>{asphaltSnapshot.segments.length} {asphaltSnapshot.segments.length % 10 === 1 && asphaltSnapshot.segments.length % 100 !== 11 ? "отрезок" : asphaltSnapshot.segments.length % 10 >= 2 && asphaltSnapshot.segments.length % 10 <= 4 && (asphaltSnapshot.segments.length % 100 < 12 || asphaltSnapshot.segments.length % 100 > 14) ? "отрезка" : "отрезков"}</span><span>{formatNumber(asphaltSnapshot.progressPercent, 1)}% длины дороги</span></div>
+                  </div>
+                </section>
+
+                {asphaltEditorOpen && <form className="asphalt-editor" onSubmit={(event) => void saveAsphaltSegment(event)}>
+                  <div className="form-title"><div><span className="field-label">УЧАСТОК ДОРОГИ</span><h2>{editingAsphaltSegmentId ? "Изменить отрезок" : "Добавить отрезок асфальта"}</h2><p>Пикетаж должен находиться в границах маршрута и не пересекать другие отрезки.</p></div><button className="close-editor" type="button" onClick={() => { setAsphaltEditorOpen(false); setEditingAsphaltSegmentId(null); setAsphaltSegmentForm(emptyAsphaltSegmentForm()); }} aria-label="Закрыть">×</button></div>
+                  <div className="asphalt-form-grid">
+                    <label>Начало, ПК<input required inputMode="decimal" placeholder="0,00" value={asphaltSegmentForm.fromPk} onChange={(event) => setAsphaltSegmentForm({ ...asphaltSegmentForm, fromPk: event.currentTarget.value })} /></label>
+                    <label>Конец, ПК<input required inputMode="decimal" placeholder="1,00" value={asphaltSegmentForm.toPk} onChange={(event) => setAsphaltSegmentForm({ ...asphaltSegmentForm, toPk: event.currentTarget.value })} /></label>
+                    <label>Ширина, м<input required type="text" inputMode="decimal" placeholder="7,00" value={asphaltSegmentForm.widthM} onChange={(event) => setAsphaltSegmentForm({ ...asphaltSegmentForm, widthM: event.currentTarget.value })} /></label>
+                    <label>Толщина, см<input required type="text" inputMode="decimal" placeholder="5,00" value={asphaltSegmentForm.thicknessCm} onChange={(event) => setAsphaltSegmentForm({ ...asphaltSegmentForm, thicknessCm: event.currentTarget.value })} /></label>
+                  </div>
+                  <div className="form-footer"><span className="form-hint">Объём считается по фактической длине отрезка × ширина × толщина.</span><div><button className="quiet-button" type="button" onClick={() => { setAsphaltEditorOpen(false); setEditingAsphaltSegmentId(null); setAsphaltSegmentForm(emptyAsphaltSegmentForm()); }}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Сохранение…" : editingAsphaltSegmentId ? "Сохранить изменения" : "Добавить отрезок"}</button></div></div>
+                </form>}
+
+                <section className="asphalt-segments-panel" aria-labelledby="asphalt-segments-title">
+                  <div className="panel-heading"><div><h2 id="asphalt-segments-title">Участки асфальта</h2><p>Объём каждого отрезка рассчитан по его длине, ширине и толщине.</p></div>{!asphaltEditorOpen && <button className="compact-button active-action" type="button" onClick={() => { setAsphaltSegmentForm(emptyAsphaltSegmentForm()); setEditingAsphaltSegmentId(null); setAsphaltEditorOpen(true); }} disabled={saving}><PlusIcon /> Добавить отрезок</button>}</div>
+                  {asphaltSnapshot.segments.length ? <div className="asphalt-segment-list">{asphaltSnapshot.segments.map((segment, index) => <article className="asphalt-segment-card" key={segment.id}>
+                    <div className="asphalt-segment-index mono">{String(index + 1).padStart(2, "0")}</div>
+                    <div className="asphalt-segment-main"><strong className="mono">ПК {formatPk(segment.fromCentiPk)} <span aria-hidden="true">→</span> {formatPk(segment.toCentiPk)}</strong><span>{formatNumber(segment.toCentiPk - segment.fromCentiPk, 0)} м длина · {formatNumber(segment.widthM, 3)} м ширина · {formatNumber(segment.thicknessCm, 3)} см толщина</span></div>
+                    <div className="asphalt-segment-volume"><span>ОБЪЁМ</span><strong className="mono">{formatNumber(segment.volumeM3, 3)} <small>м³</small></strong></div>
+                    <div className="asphalt-segment-actions"><button className="construction-edit-button" type="button" onClick={() => editAsphaltSegment(segment)} aria-label={`Изменить отрезок ${index + 1}`} disabled={saving}><EditIcon /></button><button className="construction-delete-button" type="button" onClick={() => void removeAsphaltSegment(segment)} aria-label={`Удалить отрезок ${index + 1}`} disabled={saving}><TrashIcon /></button></div>
+                  </article>)}</div> : !asphaltEditorOpen && <div className="asphalt-empty"><span className="empty-icon"><AsphaltIcon /></span><strong>Асфальтовых отрезков пока нет</strong><span>Добавьте первый участок, указав его пикетаж, ширину и толщину.</span><button className="quiet-button" type="button" onClick={() => { setAsphaltSegmentForm(emptyAsphaltSegmentForm()); setEditingAsphaltSegmentId(null); setAsphaltEditorOpen(true); }}><PlusIcon /> Добавить отрезок</button></div>}
+                </section>
+                <div className="workspace-footnote"><span>easyPTO <b>·</b> укладка асфальтового покрытия</span><span>{databaseStatus ? `Схема базы данных ${databaseStatus.schemaVersion}` : "Локальное хранилище"}</span></div>
               </>
             ) : (
             <>
@@ -1499,7 +1686,7 @@ function App() {
         <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => setProjectDialogOpen(false)}>Отмена</button><button className="primary-button" type="submit" disabled={saving}>{saving ? "Создание…" : "Создать объект"}</button></div>
       </form></div>}
       {projectDeleteDialogOpen && selectedProject && <div className="modal-backdrop" role="presentation"><section className="project-dialog" role="alertdialog" aria-modal="true" aria-labelledby="project-delete-title" aria-describedby="project-delete-copy">
-        <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ОБЪЕКТА</span><h2 id="project-delete-title">Удалить «{selectedProject.name}»?</h2><p id="project-delete-copy">Будут удалены все слои, отрезки, настройки и история этого объекта. Действие нельзя отменить.</p></div><button className="close-editor" type="button" onClick={() => setProjectDeleteDialogOpen(false)} disabled={saving} aria-label="Отмена">×</button></div>
+        <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ОБЪЕКТА</span><h2 id="project-delete-title">Удалить «{selectedProject.name}»?</h2><p id="project-delete-copy">Будут удалены слои, выполненные отрезки, участки асфальта, настройки и история этого объекта. Действие нельзя отменить.</p></div><button className="close-editor" type="button" onClick={() => setProjectDeleteDialogOpen(false)} disabled={saving} aria-label="Отмена">×</button></div>
         {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
         <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => setProjectDeleteDialogOpen(false)} disabled={saving}>Оставить объект</button><button className="danger-button" type="button" onClick={() => void confirmRemoveSelectedProject()} disabled={saving}>{saving ? "Удаление…" : "Удалить объект"}</button></div>
       </section></div>}
@@ -1551,8 +1738,8 @@ function App() {
           <header className="report-header"><div><span className="report-kicker">easyPTO · ИНЖЕНЕРНЫЙ КОНТРОЛЬ</span><h1 id="report-title">Слои дорожной одежды</h1><h2>{snapshot.project.name}</h2></div><div className="report-meta"><span>Период: ПК {formatPk(snapshot.project.routeStart)} — {formatPk(snapshot.project.routeEnd)}</span><span>Длина трассы: {formatNumber((snapshot.project.routeEnd - snapshot.project.routeStart) / 1000, 3)} км</span><span>Сформирован: {new Intl.DateTimeFormat("ru-RU", { dateStyle: "long" }).format(new Date())}</span><span>Версия расчёта: {snapshot.calculationVersion}</span></div></header>
           <section className="report-summary"><div><span>ВЫПОЛНЕНО ПО СЛОЯМ</span><strong>{roundedPercent(snapshot.summary.progressPercent)}%</strong><small>{formatKm(snapshot.summary.coveredLengthCentiPk)} из {formatKm(snapshot.summary.workAreaLengthCentiPk)} · км·слоёв</small></div><div><span>ОСТАЛОСЬ</span><strong>{formatKm(snapshot.summary.remainingLengthCentiPk)}</strong><small>суммарно по применимым слоям</small></div><div><span>НИЖЕ ПЛАНА</span><strong>{snapshot.summary.layersBehindPlan} слоя</strong><small>отклонение в п.п.</small></div></section>
           {snapshot.bridgeEnabled && bridgeArea && <section className="report-bridge"><strong>Мост</strong><span>{bridgeArea.intervals.map((range) => `ПК ${formatPk(range.fromCentiPk)}–${formatPk(range.toCentiPk)}`).join(", ")}</span><span>{bridgeLayers.length} применимых слоёв · {formatKm(bridgeLength)} на один слой</span></section>}
-          <section className="report-section"><h2>Выполнение по слоям</h2><table className="report-layer-table"><thead><tr><th>Слой</th><th>Факт</th><th>План</th><th>Δ п.п.</th><th>Фронт</th><th>Шкала трассы, ПК {formatPk(snapshot.project.routeStart)}—{formatPk(snapshot.project.routeEnd)}</th></tr></thead><tbody>{snapshot.layers.map((layer) => <tr key={layer.id}><td><span className="report-layer-title"><i style={{ background: layer.color }} />{layer.code} · {layer.name}</span><small>{formatKm(layer.coveredLengthCentiPk)} / {formatKm(layer.workAreaLengthCentiPk)}</small></td><td>{roundedPercent(layer.progressPercent)}%</td><td>{layer.planPercent === null ? "—" : `${formatNumber(layer.planPercent, 1)}%`}<small>{formatDate(layer.planDate)}</small></td><td>{layer.planDeltaPp === null ? "—" : `${layer.planDeltaPp > 0 ? "+" : ""}${formatNumber(layer.planDeltaPp, 1)}`}</td><td>{formatKm(layer.frontLengthCentiPk)}</td><td><div className="report-track">{layer.frontIntervals.map((range, index) => <i className="report-front" key={`f-${index}`} style={{ left: `${((range.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((range.toCentiPk - range.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%` }} />)}{layer.coveredIntervals.map((range, index) => <i className="report-covered" key={`c-${index}`} style={{ left: `${((range.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((range.toCentiPk - range.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, background: layer.color }} />)}</div></td></tr>)}</tbody></table></section>
-          <section className="report-section"><h2>Участки работ</h2><table className="report-segment-table"><thead><tr><th>Слой</th><th>Рабочая область</th><th>От, ПК</th><th>До, ПК</th><th>Длина</th><th>Дата</th><th>Комментарий</th></tr></thead><tbody>{snapshot.layers.flatMap((layer) => layer.segments.map((segment) => { const area = snapshot.workAreas.find((item) => item.id === segment.workAreaId); const inactiveBridge = area?.kind === "bridge" && !snapshot.bridgeEnabled; return <tr key={segment.id} className={inactiveBridge ? "not-counted" : undefined}><td>{layer.code} · {layer.name}</td><td>{area?.name ?? "—"}{inactiveBridge && <small>мост отключён</small>}</td><td className="mono">{formatPk(segment.fromCentiPk)}</td><td className="mono">{formatPk(segment.toCentiPk)}</td><td>{formatKm(segment.toCentiPk - segment.fromCentiPk)}</td><td>{formatDate(segment.workDate)}</td><td>{segment.note || "—"}</td></tr>; }))}{!snapshot.layers.some((layer) => layer.segments.length) && <tr><td colSpan={7}>Отрезков работ пока нет.</td></tr>}</tbody></table></section>
+          <section className="report-section"><h2>Выполнение по слоям</h2><table className="report-layer-table"><thead><tr><th>Слой</th><th>Факт</th><th>План</th><th>Δ п.п.</th><th>Фронт</th><th>Шкала трассы, ПК {formatPk(snapshot.project.routeStart)}—{formatPk(snapshot.project.routeEnd)}</th></tr></thead><tbody>{snapshot.layers.map((layer) => <tr key={layer.id}><td><span className="report-layer-title"><i style={{ background: layer.color }} />{layer.name}</span><small>{formatKm(layer.coveredLengthCentiPk)} / {formatKm(layer.workAreaLengthCentiPk)}</small></td><td>{roundedPercent(layer.progressPercent)}%</td><td>{layer.planPercent === null ? "—" : `${formatNumber(layer.planPercent, 1)}%`}<small>{formatDate(layer.planDate)}</small></td><td>{layer.planDeltaPp === null ? "—" : `${layer.planDeltaPp > 0 ? "+" : ""}${formatNumber(layer.planDeltaPp, 1)}`}</td><td>{formatKm(layer.frontLengthCentiPk)}</td><td><div className="report-track">{layer.frontIntervals.map((range, index) => <i className="report-front" key={`f-${index}`} style={{ left: `${((range.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((range.toCentiPk - range.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%` }} />)}{layer.coveredIntervals.map((range, index) => <i className="report-covered" key={`c-${index}`} style={{ left: `${((range.fromCentiPk - snapshot.project.routeStart) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, width: `${((range.toCentiPk - range.fromCentiPk) / (snapshot.project.routeEnd - snapshot.project.routeStart)) * 100}%`, background: layer.color }} />)}</div></td></tr>)}</tbody></table></section>
+          <section className="report-section"><h2>Участки работ</h2><table className="report-segment-table"><thead><tr><th>Слой</th><th>Рабочая область</th><th>От, ПК</th><th>До, ПК</th><th>Длина</th><th>Дата</th><th>Комментарий</th></tr></thead><tbody>{snapshot.layers.flatMap((layer) => layer.segments.map((segment) => { const area = snapshot.workAreas.find((item) => item.id === segment.workAreaId); const inactiveBridge = area?.kind === "bridge" && !snapshot.bridgeEnabled; return <tr key={segment.id} className={inactiveBridge ? "not-counted" : undefined}><td>{layer.name}</td><td>{area?.name ?? "—"}{inactiveBridge && <small>мост отключён</small>}</td><td className="mono">{formatPk(segment.fromCentiPk)}</td><td className="mono">{formatPk(segment.toCentiPk)}</td><td>{formatKm(segment.toCentiPk - segment.fromCentiPk)}</td><td>{formatDate(segment.workDate)}</td><td>{segment.note || "—"}</td></tr>; }))}{!snapshot.layers.some((layer) => layer.segments.length) && <tr><td colSpan={7}>Отрезков работ пока нет.</td></tr>}</tbody></table></section>
           <section className="report-section"><h2>Исключённые диапазоны</h2>{snapshot.exclusions.length ? <table className="report-segment-table"><thead><tr><th>Название</th><th>Диапазон, ПК</th><th>Причина</th><th>Слои</th><th>Рабочие области</th></tr></thead><tbody>{snapshot.exclusions.map((item) => <tr key={item.id}><td>{item.name}</td><td className="mono">{item.intervals.map((range) => `${formatPk(range.fromCentiPk)}–${formatPk(range.toCentiPk)}`).join(", ")}</td><td>{item.reason}</td><td>{item.appliesToLayerIds.map((id) => snapshot.layers.find((layer) => layer.id === id)?.name ?? id).join(", ")}</td><td>{item.workAreaIds.map((id) => snapshot.workAreas.find((area) => area.id === id)?.name ?? id).join(", ")}</td></tr>)}</tbody></table> : <p>Исключённых диапазонов нет.</p>}</section>
           <footer className="report-footer"><span>Сформировано приложением easyPTO</span><span>Расчётная модель {snapshot.calculationVersion}</span></footer>
         </article>
@@ -1584,6 +1771,7 @@ function EmptyProjectState({ error, onCreate }: { error: string | null; onCreate
 function LoadingState() { return <div className="loading-state" role="status"><span className="loading-indicator" /><span>Загрузка объекта…</span></div>; }
 
 function RoadIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 2 3.8 18M14 2l2.2 16M10 3v3m0 3v3m0 3v2" /></svg>; }
+function AsphaltIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 4h14M3 8h14M3 12h14M3 16h14" /><path d="M6 4v4m5 0v4m4 0v4" /></svg>; }
 function ConstructionIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 17V8l4.8-4 4.6 4v9M12.4 11.5h4.8V17M6.4 10.5h2.2m-2.2 3h2.2m6.2 0h.1M2 17h16" /></svg>; }
 function SettingsIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.5" /><path d="m8.4 2.9.5-1h2.2l.5 1 1.2.7 1.1-.2 1.1 1.9-.6.9v1.4l.6.9-1.1 1.9-1.1-.2-1.2.7-.5 1H8.9l-.5-1-1.2-.7-1.1.2L5 8.5l.6-.9V6.2L5 5.3l1.1-1.9 1.1.2 1.2-.7Z" transform="translate(0 2)" /></svg>; }
 function ChevronIcon({ expanded }: { expanded: boolean }) { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d={expanded ? "m5 12 5-5 5 5" : "m5 8 5 5 5-5"} /></svg>; }
