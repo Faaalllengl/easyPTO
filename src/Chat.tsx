@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./Chat.css";
+import { playUISFX } from "./sfx";
 
 const API_BASE = import.meta.env.VITE_CHAT_API_BASE ?? "https://faallleenn.asia/api/chat";
 
@@ -246,6 +247,10 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
     }
   }, [active, messages.length]);
 
+  useEffect(() => {
+    if (toast) playUISFX("receive");
+  }, [toast]);
+
   useLayoutEffect(() => {
     if (scrollHeightBeforeLoad.current === 0) return;
     const viewport = scrollRef.current;
@@ -269,8 +274,10 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
       onUnreadChange(unreadCount);
       setPassword("");
       setToken(result.token);
+      playUISFX("success");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+      playUISFX("error");
     } finally {
       setLoginBusy(false);
     }
@@ -283,6 +290,7 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
     setUser(null);
     setMessages([]);
     setError("");
+    playUISFX("disconnect");
   };
 
   const send = async (event: FormEvent<HTMLFormElement>) => {
@@ -301,10 +309,12 @@ export function ChatModule({ active, onUnreadChange, onOpen }: { active: boolean
       const saved = await request<ChatMessage>("/messages", token, { body, clientMessageId });
       setMessages((current) => mergeMessages(current.filter((message) => message.id !== localId), [saved]));
       retryMessage.current = null;
+      playUISFX("send");
     } catch (reason) {
       setDraft(body);
       setMessages((current) => current.filter((message) => message.id !== localId));
       setError(reason instanceof Error ? reason.message : String(reason));
+      playUISFX("error");
     } finally {
       setSending(false);
     }

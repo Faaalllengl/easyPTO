@@ -9,6 +9,7 @@ import easyPtoMark from "./assets/easypto-mark.svg";
 import "./App.css";
 import { exportConstructionExcel, exportConstructionWord, exportExcel, exportWord, type ReportSnapshot } from "./report";
 import { ChatModule } from "./Chat";
+import { initializeUISFX, isUISFXEnabled, playUISFX, setUISFXEnabled, type CueName } from "./sfx";
 
 type DatabaseStatus = { schemaVersion: number; currentSchemaVersion: number };
 type ProjectListItem = {
@@ -106,7 +107,12 @@ const getSavedTheme = (): "light" | "dark" => {
 };
 type ConstructionDeleteTarget =
   | { kind: "line"; line: ConstructionLine }
-  | { kind: "entry"; line: ConstructionLine; entry: ConstructionProgressEntry };
+  | { kind: "entry"; line: ConstructionLine; entry: ConstructionProgressEntry }
+  | { kind: "asphalt-segment"; segment: AsphaltSegment }
+  | { kind: "layer"; layer: LayerSnapshot }
+  | { kind: "segment"; segment: Segment }
+  | { kind: "exclusion"; exclusion: Exclusion }
+  | { kind: "work-area"; area: WorkArea; segmentCount: number };
 const areaProgress = (projectSnapshot: ProjectSnapshot, areaId: string | null, enabled = true) => {
   if (!enabled || !areaId) return { covered: 0, total: 0, percent: 0 };
   const area = projectSnapshot.workAreas.find((item) => item.id === areaId);
@@ -221,6 +227,7 @@ function App() {
   const [constructionSnapshot, setConstructionSnapshot] = useState<ConstructionSnapshot | null>(null);
   const [asphaltSnapshot, setAsphaltSnapshot] = useState<AsphaltSnapshot | null>(null);
   const [activeModule, setActiveModule] = useState<ActiveModule>(getStartupModule);
+  const [soundEnabled, setSoundEnabled] = useState(isUISFXEnabled);
   const chatReturnScrollTop = useRef(0);
   const [chatUnread, setChatUnread] = useState(0);
   const updateChatUnread = useCallback((count: number) => setChatUnread(count), []);
@@ -304,6 +311,22 @@ function App() {
   const [updateCheckMessage, setUpdateCheckMessage] = useState<{ text: string; isError?: boolean } | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
+  useEffect(() => initializeUISFX(), []);
+  useEffect(() => {
+    if (error) playUISFX("error");
+  }, [error]);
+
+  const showNotice = (message: string, cue: CueName = "success") => {
+    setNotice(message);
+    playUISFX(cue);
+  };
+
+  const changeSoundPreference = (enabled: boolean) => {
+    setSoundEnabled(enabled);
+    setUISFXEnabled(enabled);
+    playUISFX(enabled ? "toggle-on" : "toggle-off");
+  };
+
   const refreshProjects = async () => {
     const items = await invoke<ProjectListItem[]>("list_projects");
     setProjects(items);
@@ -325,7 +348,7 @@ function App() {
         const construction = await invoke<ConstructionSnapshot>("get_construction_snapshot", { projectId: selectedProjectId });
         setConstructionSnapshot(construction);
       }
-      setNotice("Название объекта изменено.");
+      showNotice("Название объекта изменено.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -347,7 +370,7 @@ function App() {
         setSnapshot((current) => current ? { ...current, project } : current);
       }
       setConstructionAddressEditing(false);
-      setNotice("Адрес объекта сохранён.");
+      showNotice("Адрес объекта сохранён.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -374,7 +397,7 @@ function App() {
       const next = remaining[0];
       setSelectedProjectId(next.id);
       localStorage.setItem("easypto.activeProjectId", next.id);
-      setNotice("Объект удалён.");
+      showNotice("Объект удалён.", "delete");
       setProjectDeleteDialogOpen(false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -390,6 +413,7 @@ function App() {
 
   const openHistory = async () => {
     setHistoryDialogOpen(true);
+    playUISFX("expand");
     try {
       await refreshBackups();
     } catch (reason) {
@@ -403,7 +427,7 @@ function App() {
     try {
       const created = await invoke<BackupEntry>("create_backup");
       await refreshBackups();
-      setNotice(`Резервная копия создана: ${created.fileName}`);
+      showNotice(`Резервная копия создана: ${created.fileName}`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -429,7 +453,7 @@ function App() {
         setSnapshot(restoredSnapshot);
       }
       await refreshBackups();
-      setNotice("База восстановлена. Текущая версия перед этим сохранена в резервную копию.");
+      showNotice("База восстановлена. Текущая версия перед этим сохранена в резервную копию.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -489,6 +513,7 @@ function App() {
   }, [theme]);
 
   const selectModule = (module: ActiveModule) => {
+    if (module !== activeModule) playUISFX("expand");
     if (module === "chat") {
       if (activeModule !== "chat") chatReturnScrollTop.current = window.scrollY;
       window.scrollTo(0, 0);
@@ -519,7 +544,11 @@ function App() {
       if (update) {
         setAvailableUpdate(update);
         setUpdateCheckMessage({ text: `Доступна версия ${update.version}.` });
-      } else setUpdateCheckMessage({ text: "Установлена последняя версия easyPTO." });
+        playUISFX("notification");
+      } else {
+        setUpdateCheckMessage({ text: "Установлена последняя версия easyPTO." });
+        playUISFX("success");
+      }
     } catch (reason) {
       setUpdateCheckMessage({ text: `Не удалось проверить: ${reason instanceof Error ? reason.message : String(reason)}`, isError: true });
     } finally {
@@ -640,7 +669,7 @@ function App() {
       setAsphaltEditorOpen(false);
       setEditingAsphaltSegmentId(null);
       setAsphaltSegmentForm(emptyAsphaltSegmentForm());
-      setNotice(editing ? "Асфальтовый участок изменён." : "Асфальтовый участок добавлен.");
+      showNotice(editing ? "Асфальтовый участок изменён." : "Асфальтовый участок добавлен.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -657,21 +686,13 @@ function App() {
       thicknessCm: String(segment.thicknessCm).replace(".", ","),
     });
     setAsphaltEditorOpen(true);
+    playUISFX("expand");
   };
 
-  const removeAsphaltSegment = async (segment: AsphaltSegment) => {
-    if (!selectedProjectId || !window.confirm(`Удалить участок ${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК?`)) return;
-    setSaving(true);
+  const removeAsphaltSegment = (segment: AsphaltSegment) => {
+    setConstructionDeleteTarget({ kind: "asphalt-segment", segment });
     setError(null);
-    try {
-      const updated = await invoke<AsphaltSnapshot>("delete_asphalt_segment", { projectId: selectedProjectId, segmentId: segment.id });
-      setAsphaltSnapshot(updated);
-      setNotice("Асфальтовый участок удалён.");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSaving(false);
-    }
+    playUISFX("expand");
   };
 
   useEffect(() => {
@@ -690,6 +711,7 @@ function App() {
   const openConstructionGuide = () => {
     setConstructionGuideStep(0);
     setConstructionGuideOpen(true);
+    playUISFX("expand");
   };
 
   const closeConstructionGuide = () => setConstructionGuideOpen(false);
@@ -719,7 +741,7 @@ function App() {
       setConstructionSnapshot(updated);
       setConstructionLineForm({ name: "", unit: "meters", plannedAmount: "" });
       setConstructionLineEditorOpen(false);
-      setNotice("Линия данных добавлена.");
+      showNotice("Линия данных добавлена.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -742,7 +764,7 @@ function App() {
       setSnapshot(projectState);
       setConstructionSnapshot(updated);
       setConstructionProgressAmount("");
-      setNotice(`Выполненный объём добавлен: ${line.name}.`);
+      showNotice(`Выполненный объём добавлен: ${line.name}.`, "complete");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -753,6 +775,7 @@ function App() {
   const removeConstructionLine = (line: ConstructionLine) => {
     setConstructionDeleteTarget({ kind: "line", line });
     setError(null);
+    playUISFX("expand");
   };
 
   const adoptConstructionSnapshot = async (updated: ConstructionSnapshot) => {
@@ -774,7 +797,7 @@ function App() {
       });
       await adoptConstructionSnapshot(updated);
       setEditingConstructionLineId(null);
-      setNotice("Название линии изменено.");
+      showNotice("Название линии изменено.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -798,7 +821,7 @@ function App() {
       await adoptConstructionSnapshot(updated);
       setEditingConstructionEntryId(null);
       setConstructionEntryAmount("");
-      setNotice("Запись выполнения исправлена.");
+      showNotice("Запись выполнения исправлена.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -809,6 +832,7 @@ function App() {
   const removeConstructionEntry = (line: ConstructionLine, entry: ConstructionProgressEntry) => {
     setConstructionDeleteTarget({ kind: "entry", line, entry });
     setError(null);
+    playUISFX("expand");
   };
 
   const confirmConstructionDelete = async () => {
@@ -817,20 +841,47 @@ function App() {
     setError(null);
     try {
       const target = constructionDeleteTarget;
-      const updated = target.kind === "line"
-        ? await invoke<ConstructionSnapshot>("delete_construction_line", { projectId: selectedProjectId, lineId: target.line.id })
-        : await invoke<ConstructionSnapshot>("delete_construction_progress", {
+      if (target.kind === "line" || target.kind === "entry") {
+        const updated = target.kind === "line"
+          ? await invoke<ConstructionSnapshot>("delete_construction_line", { projectId: selectedProjectId, lineId: target.line.id })
+          : await invoke<ConstructionSnapshot>("delete_construction_progress", {
           projectId: selectedProjectId,
           lineId: target.line.id,
           entryId: target.entry.id,
         });
-      await adoptConstructionSnapshot(updated);
-      if (target.kind === "line") {
-        if (activeConstructionLineId === target.line.id) setActiveConstructionLineId(null);
-        setNotice(`Линия «${target.line.name}» и её записи удалены.`);
+        await adoptConstructionSnapshot(updated);
+        if (target.kind === "line") {
+          if (activeConstructionLineId === target.line.id) setActiveConstructionLineId(null);
+          showNotice(`Линия «${target.line.name}» и её записи удалены.`, "delete");
+        } else {
+          if (editingConstructionEntryId === target.entry.id) setEditingConstructionEntryId(null);
+          showNotice("Запись выполнения удалена.", "delete");
+        }
+      } else if (target.kind === "asphalt-segment") {
+        const updated = await invoke<AsphaltSnapshot>("delete_asphalt_segment", { projectId: selectedProjectId, segmentId: target.segment.id });
+        setAsphaltSnapshot(updated);
+        showNotice("Асфальтовый участок удалён.", "delete");
+      } else if (target.kind === "layer") {
+        const updated = await invoke<ProjectSnapshot>("delete_layer", { projectId: selectedProjectId, layerId: target.layer.id });
+        adoptSnapshot(updated);
+        setSelectedLayerId(updated.layers[0]?.id ?? "");
+        setLayerEditorOpen(false);
+        await refreshProjects();
+        showNotice("Слой удалён.", "delete");
+      } else if (target.kind === "segment") {
+        if (!selectedLayer) return;
+        const updated = await invoke<ProjectSnapshot>("delete_segment", { projectId: selectedProjectId, layerId: selectedLayer.id, segmentId: target.segment.id });
+        adoptSnapshot(updated);
+        await refreshProjects();
+        showNotice("Отрезок удалён.", "delete");
+      } else if (target.kind === "exclusion") {
+        const updated = await invoke<ProjectSnapshot>("delete_exclusion", { projectId: selectedProjectId, exclusionId: target.exclusion.id });
+        adoptSnapshot(updated);
+        showNotice("Исключение удалено; показатели пересчитаны.", "delete");
       } else {
-        if (editingConstructionEntryId === target.entry.id) setEditingConstructionEntryId(null);
-        setNotice("Запись выполнения удалена.");
+        const updated = await invoke<ProjectSnapshot>("delete_custom_work_area", { projectId: selectedProjectId, workAreaId: target.area.id });
+        adoptSnapshot(updated);
+        showNotice("Рабочая область удалена; показатели пересчитаны.", "delete");
       }
       setConstructionDeleteTarget(null);
     } catch (reason) {
@@ -887,7 +938,7 @@ function App() {
       setSelectedLayerId(result.layers[0]?.id ?? "");
       setProjectDialogOpen(false);
       setProjectName("");
-      setNotice("Объект создан. Начальные слои готовы к настройке.");
+      showNotice("Объект создан. Начальные слои готовы к настройке.", "complete");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -901,6 +952,7 @@ function App() {
     setLayerEditorOpen(true);
     setSegmentEditorOpen(false);
     setError(null);
+    playUISFX("expand");
   };
 
   const beginLayerOrderEdit = () => {
@@ -936,7 +988,7 @@ function App() {
       });
       adoptSnapshot(updated);
       setLayerOrderEditing(false);
-      setNotice("Порядок слоёв и базовые слои обновлены.");
+      showNotice("Порядок слоёв и базовые слои обновлены.");
       await refreshProjects();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -962,6 +1014,7 @@ function App() {
     setLayerEditorOpen(true);
     setSegmentEditorOpen(false);
     setError(null);
+    playUISFX("expand");
   };
 
   const submitLayer = async (event: FormEvent<HTMLFormElement>) => {
@@ -1001,7 +1054,7 @@ function App() {
       }
       await refreshProjects();
       setLayerEditorOpen(false);
-      setNotice(editingLayerId ? "Параметры слоя сохранены." : "Слой добавлен.");
+      showNotice(editingLayerId ? "Параметры слоя сохранены." : "Слой добавлен.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1009,26 +1062,10 @@ function App() {
     }
   };
 
-  const removeLayer = async (layer: LayerSnapshot) => {
-    if (!selectedProjectId) return;
-    const message = layer.segments.length
-      ? `Удалить слой «${layer.name}» и ${layer.segments.length} ${layer.segments.length === 1 ? "отрезок" : "отрезка/отрезков"}? Данные слоя будут удалены.`
-      : `Удалить слой «${layer.name}»?`;
-    if (!window.confirm(message)) return;
-    setSaving(true);
+  const removeLayer = (layer: LayerSnapshot) => {
+    setConstructionDeleteTarget({ kind: "layer", layer });
     setError(null);
-    try {
-      const updated = await invoke<ProjectSnapshot>("delete_layer", { projectId: selectedProjectId, layerId: layer.id });
-      adoptSnapshot(updated);
-      setSelectedLayerId(updated.layers[0]?.id ?? "");
-      setLayerEditorOpen(false);
-      await refreshProjects();
-      setNotice("Слой удалён.");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSaving(false);
-    }
+    playUISFX("expand");
   };
 
   const beginCreateSegment = () => {
@@ -1038,6 +1075,7 @@ function App() {
     setSegmentEditorOpen(true);
     setLayerEditorOpen(false);
     setError(null);
+    playUISFX("expand");
   };
 
   const beginEditSegment = (segment: Segment) => {
@@ -1052,6 +1090,7 @@ function App() {
     setSegmentEditorOpen(true);
     setLayerEditorOpen(false);
     setError(null);
+    playUISFX("expand");
   };
 
   const submitSegment = async (event: FormEvent<HTMLFormElement>) => {
@@ -1073,7 +1112,7 @@ function App() {
       adoptSnapshot(updated);
       await refreshProjects();
       setSegmentEditorOpen(false);
-      setNotice(editingSegmentId ? "Отрезок обновлён." : "Отрезок сохранён.");
+      showNotice(editingSegmentId ? "Отрезок обновлён." : "Отрезок сохранён.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1081,25 +1120,10 @@ function App() {
     }
   };
 
-  const removeSegment = async (segment: Segment) => {
-    if (!selectedProjectId || !selectedLayer) return;
-    if (!window.confirm(`Удалить отрезок ${formatPk(segment.fromCentiPk)}–${formatPk(segment.toCentiPk)} ПК?`)) return;
-    setSaving(true);
+  const removeSegment = (segment: Segment) => {
+    setConstructionDeleteTarget({ kind: "segment", segment });
     setError(null);
-    try {
-      const updated = await invoke<ProjectSnapshot>("delete_segment", {
-        projectId: selectedProjectId,
-        layerId: selectedLayer.id,
-        segmentId: segment.id,
-      });
-      adoptSnapshot(updated);
-      await refreshProjects();
-      setNotice("Отрезок удалён.");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSaving(false);
-    }
+    playUISFX("expand");
   };
 
   const closeLayerEditor = () => { setLayerEditorOpen(false); setError(null); };
@@ -1118,6 +1142,7 @@ function App() {
     setBridgePreview(null);
     setBridgeSettingsOpen(true);
     setError(null);
+    playUISFX("expand");
   };
 
   const previewBridge = async () => {
@@ -1151,7 +1176,7 @@ function App() {
       await refreshProjects();
       setBridgeSettingsOpen(false);
       setBridgePreview(null);
-      setNotice(bridgeForm.enabled ? "Настройки моста сохранены." : "Мост отключён. Его настройки и записи сохранены.");
+      showNotice(bridgeForm.enabled ? "Настройки моста сохранены." : "Мост отключён. Его настройки и записи сохранены.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1163,6 +1188,7 @@ function App() {
     setExclusionForm({ ...emptyExclusionForm(), layerIds: snapshot?.layers.map((layer) => layer.id) ?? [], workAreaIds: snapshot?.workAreas.filter((area) => area.kind !== "bridge" || snapshot.bridgeEnabled).map((area) => area.id) ?? [] });
     setExclusionEditorOpen(true);
     setError(null);
+    playUISFX("expand");
   };
 
   const beginEditExclusion = (exclusion: Exclusion) => {
@@ -1177,6 +1203,7 @@ function App() {
     });
     setExclusionEditorOpen(true);
     setError(null);
+    playUISFX("expand");
   };
 
   const saveExclusion = async (event: FormEvent<HTMLFormElement>) => {
@@ -1193,7 +1220,7 @@ function App() {
       adoptSnapshot(updated);
       setExclusionEditorOpen(false);
       setExclusionForm(emptyExclusionForm());
-      setNotice(exclusionForm.id ? "Исключение обновлено; показатели пересчитаны." : "Исключённый диапазон добавлен; показатели пересчитаны.");
+      showNotice(exclusionForm.id ? "Исключение обновлено; показатели пересчитаны." : "Исключённый диапазон добавлен; показатели пересчитаны.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1201,19 +1228,10 @@ function App() {
     }
   };
 
-  const removeExclusion = async (exclusion: Exclusion) => {
-    if (!selectedProjectId || !window.confirm(`Удалить исключение «${exclusion.name}»?`)) return;
-    setSaving(true);
+  const removeExclusion = (exclusion: Exclusion) => {
+    setConstructionDeleteTarget({ kind: "exclusion", exclusion });
     setError(null);
-    try {
-      const updated = await invoke<ProjectSnapshot>("delete_exclusion", { projectId: selectedProjectId, exclusionId: exclusion.id });
-      adoptSnapshot(updated);
-      setNotice("Исключение удалено; показатели пересчитаны.");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSaving(false);
-    }
+    playUISFX("expand");
   };
 
   const saveWorkArea = async (event: FormEvent<HTMLFormElement>) => {
@@ -1226,7 +1244,7 @@ function App() {
       adoptSnapshot(updated);
       setWorkAreaEditorOpen(false);
       setWorkAreaForm({ name: "", fromPk: "", toPk: "", layerIds: [] });
-      setNotice("Рабочая область добавлена; показатели пересчитаны.");
+      showNotice("Рабочая область добавлена; показатели пересчитаны.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1234,28 +1252,18 @@ function App() {
     }
   };
 
-  const removeWorkArea = async (area: WorkArea) => {
-    if (!selectedProjectId) return;
+  const removeWorkArea = (area: WorkArea) => {
     const segmentCount = snapshot?.layers.reduce((count, layer) => count + layer.segments.filter((segment) => segment.workAreaId === area.id).length, 0) ?? 0;
-    const message = segmentCount ? `Удалить область «${area.name}» и связанные отрезки (${segmentCount})?` : `Удалить рабочую область «${area.name}»?`;
-    if (!window.confirm(message)) return;
-    setSaving(true);
+    setConstructionDeleteTarget({ kind: "work-area", area, segmentCount });
     setError(null);
-    try {
-      const updated = await invoke<ProjectSnapshot>("delete_custom_work_area", { projectId: selectedProjectId, workAreaId: area.id });
-      adoptSnapshot(updated);
-      setNotice("Рабочая область удалена; показатели пересчитаны.");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setSaving(false);
-    }
+    playUISFX("expand");
   };
 
   const canExportCurrentSnapshot = () => Boolean(snapshot && snapshot.project.id === selectedProjectId && !saving && !error);
   const openReportPreview = () => {
     if (!canExportCurrentSnapshot()) return;
     setReportDialogOpen(true);
+    playUISFX("expand");
   };
 
   const runExport = async (format: "excel" | "word") => {
@@ -1266,7 +1274,7 @@ function App() {
       const saved = format === "excel"
         ? await exportExcel(snapshot as ReportSnapshot)
         : await exportWord(snapshot as ReportSnapshot);
-      if (saved) setNotice(format === "excel" ? "Файл Excel сохранён." : "Файл Word сохранён.");
+      if (saved) showNotice(format === "excel" ? "Файл Excel сохранён." : "Файл Word сохранён.", "complete");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1283,7 +1291,7 @@ function App() {
       const saved = format === "excel"
         ? await exportConstructionExcel(constructionSnapshot)
         : await exportConstructionWord(constructionSnapshot);
-      if (saved) setNotice(format === "excel" ? "Файл Excel сохранён." : "Файл Word сохранён.");
+      if (saved) showNotice(format === "excel" ? "Файл Excel сохранён." : "Файл Word сохранён.", "complete");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -1296,6 +1304,20 @@ function App() {
     return dates?.[0] ?? dateToday();
   }, [constructionSnapshot]);
 
+  const getDeleteDescription = (target: ConstructionDeleteTarget) => {
+    if (target.kind === "line") return `Удалить линию «${target.line.name}» и все её записи выполнения? Общий прогресс объекта будет пересчитан.`;
+    if (target.kind === "entry") return `Удалить запись ${formatNumber(target.entry.amount, unitMeta(target.line.unit).precision)} ${unitMeta(target.line.unit).short} из линии «${target.line.name}»? Прогресс будет пересчитан.`;
+    if (target.kind === "asphalt-segment") return `Удалить асфальтовый отрезок ${formatPk(target.segment.fromCentiPk)}–${formatPk(target.segment.toCentiPk)} ПК? Объём асфальта будет пересчитан.`;
+    if (target.kind === "layer") return target.layer.segments.length
+      ? `Удалить слой «${target.layer.name}» и связанные отрезки (${target.layer.segments.length})? Показатели будут пересчитаны.`
+      : `Удалить слой «${target.layer.name}»?`;
+    if (target.kind === "segment") return `Удалить отрезок ${formatPk(target.segment.fromCentiPk)}–${formatPk(target.segment.toCentiPk)} ПК? Показатели слоя будут пересчитаны.`;
+    if (target.kind === "exclusion") return `Удалить исключение «${target.exclusion.name}»? Показатели будут пересчитаны.`;
+    return target.segmentCount
+      ? `Удалить область «${target.area.name}» и связанные отрезки (${target.segmentCount})? Показатели будут пересчитаны.`
+      : `Удалить рабочую область «${target.area.name}»?`;
+  };
+
   return (
     <div className={`application${activeModule === "chat" ? " chat-active" : ""}`}>
       <a className="skip-link" href="#main-content">Перейти к содержимому</a>
@@ -1306,12 +1328,12 @@ function App() {
         <div className="topbar-divider" />
         <label className="object-context">
           <span className="context-label">ОБЪЕКТ</span>
-          <select className="object-select" aria-label="Выбрать объект" value={selectedProjectId} onChange={(event) => { cancelLayerOrderEdit(); setSelectedProjectId(event.currentTarget.value); }} disabled={!projects.length}>
+          <select className="object-select" aria-label="Выбрать объект" value={selectedProjectId} onChange={(event) => { cancelLayerOrderEdit(); setSelectedProjectId(event.currentTarget.value); playUISFX("select"); }} disabled={!projects.length}>
             {!projects.length && <option value="">Нет объектов</option>}
             {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
           </select>
         </label>
-        <button className="new-project-button" type="button" onClick={() => setProjectDialogOpen(true)} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
+        <button className="new-project-button" type="button" onClick={() => { setProjectDialogOpen(true); playUISFX("expand"); }} title="Создать объект"><span aria-hidden="true">＋</span><span>Объект</span></button>
         <label className="mobile-module-switch"><span className="visually-hidden">Выбрать раздел</span><select aria-label="Выбрать раздел" value={activeModule} onChange={(event) => selectModule(event.currentTarget.value as ActiveModule)}><option value="layers">Слои</option><option value="construction">Строительство</option><option value="asphalt">Асфальт</option><option value="chat">Чат{chatUnread ? ` · ${chatUnread}` : ""}</option><option value="settings">Настройки</option></select></label>
         <div className="topbar-spacer" />
         <div className={`save-state${saving ? " is-saving" : ""}${error ? " is-error" : ""}`} aria-live="polite">
@@ -1346,6 +1368,10 @@ function App() {
               <div className="settings-section-heading"><h2 id="settings-appearance-title">Внешний вид</h2><p>Настройте оформление интерфейса приложения.</p></div>
               <label className="settings-row"><span><strong>Тема интерфейса</strong><small>Выбранная тема сохранится для следующих запусков.</small></span><select value={theme} onChange={(event) => setTheme(event.currentTarget.value as "light" | "dark")}><option value="light">Светлая</option><option value="dark">Тёмная</option></select></label>
             </section>
+            <section className="settings-section" aria-labelledby="settings-sound-title">
+              <div className="settings-section-heading"><h2 id="settings-sound-title">Звуки интерфейса</h2><p>Короткие звуковые сигналы в спокойной палитре Zen.</p></div>
+              <label className="settings-row"><span><strong>Звуковые эффекты</strong><small>Можно отключить в любой момент. Настройка сохранится на этом устройстве.</small></span><select aria-label="Звуковые эффекты" value={soundEnabled ? "on" : "off"} onChange={(event) => changeSoundPreference(event.currentTarget.value === "on")}><option value="on">Включены</option><option value="off">Выключены</option></select></label>
+            </section>
             <section className="settings-section" aria-labelledby="settings-workspace-title">
               <div className="settings-section-heading"><h2 id="settings-workspace-title">Рабочее место</h2><p>Выберите раздел, который будет открываться при следующем запуске.</p></div>
               <label className="settings-row"><span><strong>Раздел при запуске</strong><small>Можно изменить в любой момент в боковом меню.</small></span><select value={startupModule} onChange={(event) => saveStartupModule(event.currentTarget.value as "layers" | "construction")}><option value="layers">Слои дорожной одежды</option><option value="construction">Строительство</option></select></label>
@@ -1362,7 +1388,7 @@ function App() {
               <div className="settings-row"><span><strong>Обновления</strong><small>Проверяйте обновления вручную или дождитесь автоматической проверки при запуске.</small></span><div className="update-check-action"><button className="quiet-button" type="button" onClick={() => void checkForUpdates()} disabled={checkingForUpdates || installingUpdate}>Проверить обновления</button><span className={`update-check-status${checkingForUpdates ? " is-checking" : ""}${updateCheckMessage?.isError ? " is-error" : ""}`} aria-live="polite" aria-atomic="true">{checkingForUpdates ? <><i className="update-spinner" aria-hidden="true" />Проверяем…</> : updateCheckMessage?.text}</span></div></div>
             </section>
           </> : loading && !snapshot ? <LoadingState /> : !snapshot ? (
-            <EmptyProjectState error={error} onCreate={() => setProjectDialogOpen(true)} />
+            <EmptyProjectState error={error} onCreate={() => { setProjectDialogOpen(true); playUISFX("expand"); }} />
           ) : (
             activeModule === "construction" ? (
               constructionLoading ? <LoadingState /> : !constructionSnapshot ? <>
@@ -1407,7 +1433,7 @@ function App() {
                     const { short: unitShort, precision } = unitMeta(line.unit);
                     return <article className={`construction-line${expanded ? " expanded" : ""}`} key={line.id}>
                       <div className="construction-line-row">
-                        <button className="construction-line-main" type="button" onClick={() => { setActiveConstructionLineId(expanded ? null : line.id); setConstructionProgressAmount(""); setEditingConstructionLineId(null); setEditingConstructionEntryId(null); }} aria-expanded={expanded}>
+                        <button className="construction-line-main" type="button" onClick={() => { if (!expanded) playUISFX("select"); setActiveConstructionLineId(expanded ? null : line.id); setConstructionProgressAmount(""); setEditingConstructionLineId(null); setEditingConstructionEntryId(null); }} aria-expanded={expanded}>
                           <span className="construction-line-index mono">{String(index + 1).padStart(2, "0")}</span>
                           <span className="construction-line-content"><strong>{line.name}</strong><span>Выполнено {formatNumber(line.completedAmount, precision)} из {formatNumber(line.plannedAmount, precision)} {unitShort}</span><span className="construction-line-track" aria-hidden="true"><i style={{ width: `${Math.min(100, Math.max(0, line.progressPercent))}%` }} /></span></span>
                           <strong className="construction-line-percent">{roundedPercent(line.progressPercent)}%</strong>
@@ -1563,7 +1589,7 @@ function App() {
                 </div> : <div className="table-scroll">
                   <div className="layer-grid table-head"><div className="head-layer">СЛОЙ</div><div className="head-fact">ФАКТ</div><div className="head-plan">ПЛАН · ДАТА</div><div className="head-delta">Δ П.П.</div><div className="head-front">ФРОНТ</div><div className="head-scale"><div className="scale-title">ПИКЕТАЖНАЯ ШКАЛА</div><div className="scale-values mono">{[0, 25, 50, 75, 100].map((fraction) => <span key={fraction}>{formatPk(Math.round(snapshot.project.routeStart + (snapshot.project.routeEnd - snapshot.project.routeStart) * fraction / 100))}{fraction === 100 ? " ПК" : ""}</span>)}</div></div></div>
                   <div className="layer-list">
-                    {visibleLayers.map((layer) => <LayerRow key={layer.id} layer={layer} project={snapshot.project} searchPosition={currentFilterPosition} selected={selectedLayerId === layer.id} onSelect={() => { setSelectedLayerId(layer.id); setLayerEditorOpen(false); setSegmentEditorOpen(false); }} />)}
+                    {visibleLayers.map((layer) => <LayerRow key={layer.id} layer={layer} project={snapshot.project} searchPosition={currentFilterPosition} selected={selectedLayerId === layer.id} onSelect={() => { setSelectedLayerId(layer.id); setLayerEditorOpen(false); setSegmentEditorOpen(false); playUISFX("select"); }} />)}
                     {!visibleLayers.length && <div className="empty-filter"><span className="empty-icon">✓</span><strong>Под фильтр не попали слои</strong><span>Смените фильтр или добавьте новый слой.</span></div>}
                   </div>
                 </div>}
@@ -1726,9 +1752,7 @@ function App() {
         </article>
       </section></div>}
       {constructionDeleteTarget && <div className="modal-backdrop construction-delete-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setConstructionDeleteTarget(null); }}><section className="project-dialog construction-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="construction-delete-title" aria-describedby="construction-delete-description">
-        <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ДАННЫХ</span><h2 id="construction-delete-title">Подтвердите удаление</h2><p id="construction-delete-description">{constructionDeleteTarget.kind === "line"
-          ? `Удалить линию «${constructionDeleteTarget.line.name}» и все её записи выполнения? Общий прогресс объекта будет пересчитан.`
-          : `Удалить запись ${formatNumber(constructionDeleteTarget.entry.amount, unitMeta(constructionDeleteTarget.line.unit).precision)} ${unitMeta(constructionDeleteTarget.line.unit).short} из линии «${constructionDeleteTarget.line.name}»? Прогресс будет пересчитан.`}</p></div><button className="close-editor" type="button" onClick={() => setConstructionDeleteTarget(null)} disabled={saving} aria-label="Отмена">×</button></div>
+        <div className="dialog-heading"><div><span className="field-label">УДАЛЕНИЕ ДАННЫХ</span><h2 id="construction-delete-title">Подтвердите удаление</h2><p id="construction-delete-description">{getDeleteDescription(constructionDeleteTarget)}</p></div><button className="close-editor" type="button" onClick={() => setConstructionDeleteTarget(null)} disabled={saving} aria-label="Отмена">×</button></div>
         {error && <div className="inline-message error-message" role="alert"><InfoIcon />{error}</div>}
         <div className="dialog-footer"><button className="quiet-button" type="button" onClick={() => { setConstructionDeleteTarget(null); setError(null); }} disabled={saving}>Отмена</button><button className="danger-button" type="button" onClick={() => void confirmConstructionDelete()} disabled={saving}>{saving ? "Удаление…" : "Удалить"}</button></div>
       </section></div>}
